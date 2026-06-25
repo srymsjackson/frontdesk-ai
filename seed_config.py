@@ -7,7 +7,7 @@ from app.models import Business, BusinessConfig
 with Session(engine) as session:
     # Find the business created by seed.py.
     business = session.exec(
-        select(Business).where(Business.name == "Test Barber Shop")
+        select(Business).where(Business.name == "The Shaky Razor")
     ).first()
 
     if not business:
