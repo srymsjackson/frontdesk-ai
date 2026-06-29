@@ -15,6 +15,8 @@ from app.services.config_service import (
 )
 from app.config import settings
 from twilio.twiml.voice_response import VoiceResponse, Gather
+from fastapi.responses import Response as FastAPIResponse
+from app.services.voice_service import generate_audio, get_audio
 
 router = APIRouter(prefix="/voice", tags=["voice"])
 
@@ -31,7 +33,10 @@ def full_url(path: str) -> str:
 
 
 def gather_response(prompt_text: str, action_path: str) -> str:
-    """Return TwiML that asks for speech and posts the response to action_path."""
+    """Return TwiML that asks for speech and posts the response to action_path.
+
+    Uses ElevenLabs audio when enabled, falling back to Twilio <Say> on failure.
+    """
     response = VoiceResponse()
     gather = Gather(
         input="speech",
@@ -40,7 +45,17 @@ def gather_response(prompt_text: str, action_path: str) -> str:
         timeout=5,
         speech_timeout="auto",
     )
-    gather.say(prompt_text)
+
+    if settings.use_elevenlabs:
+        audio_id = generate_audio(prompt_text)
+        if audio_id:
+            gather.play(full_url(f"/voice/audio/{audio_id}.mp3"))
+        else:
+            # Generation failed; fall back to Twilio's built-in voice.
+            gather.say(prompt_text)
+    else:
+        gather.say(prompt_text)
+
     response.append(gather)
     response.say("We did not receive your response. Goodbye.")
     response.hangup()
@@ -237,6 +252,21 @@ def collect_turn(
     )
 
     response = VoiceResponse()
-    response.say(completion_message)
+    if settings.use_elevenlabs:
+        audio_id = generate_audio(completion_message)
+        if audio_id:
+            response.play(full_url(f"/voice/audio/{audio_id}.mp3"))
+        else:
+            response.say(completion_message)
+    else:
+        response.say(completion_message)
     response.hangup()
     return Response(content=str(response), media_type="application/xml")
+
+@router.get("/audio/{audio_id}.mp3")
+def serve_audio(audio_id: str):
+    """Serve a generated MP3 from the in-memory cache, for Twilio to <Play>."""
+    audio_bytes = get_audio(audio_id)
+    if not audio_bytes:
+        return FastAPIResponse(status_code=404, content="Not found")
+    return FastAPIResponse(content=audio_bytes, media_type="audio/mpeg")

@@ -29,5 +29,10 @@ class Settings(BaseModel):
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
+    use_elevenlabs: bool = os.getenv("USE_ELEVENLABS", "false").lower() == "true"
+    elevenlabs_api_key: str = os.getenv("ELEVENLABS_API_KEY", "")
+    elevenlabs_voice_id: str = os.getenv("ELEVENLABS_VOICE_ID", "")
+    elevenlabs_model: str = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
+
 
 settings = Settings()
