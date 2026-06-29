@@ -11,7 +11,7 @@ from app.routes.voice import router as voice_router
 from app.routes.sms import router as sms_router
 from app.routes.leads import router as leads_router
 from app.routes.calls import router as calls_router
-
+from app.routes.dashboard import router as dashboard_router
 
 app = FastAPI(title=settings.app_name)
 
