@@ -45,6 +45,7 @@ def generate_audio(text: str) -> Optional[str]:
             text=text,
             model_id=settings.elevenlabs_model,
             output_format="mp3_22050_32",  # phone-quality mp3, smaller files
+            optimize_streaming_latency = 4
         )
         audio_bytes = b"".join(audio_iter)
 

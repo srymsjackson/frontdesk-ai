@@ -17,6 +17,9 @@ from app.config import settings
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from fastapi.responses import Response as FastAPIResponse
 from app.services.voice_service import generate_audio, get_audio
+import asyncio
+from datetime import datetime, timezone
+from ..websocket_manager import manager
 
 router = APIRouter(prefix="/voice", tags=["voice"])
 
@@ -30,6 +33,15 @@ def normalize_number(num: str):
 def full_url(path: str) -> str:
     """Build absolute callback URLs Twilio can post back to."""
     return f"{settings.base_url.rstrip('/')}{path}"
+
+# ── NEW: masks caller name for demo page (e.g. "Jackson Strazzo" → "Jackson S.")
+def _display_name(full_name: str | None) -> str:
+    if not full_name:
+        return "Unknown Caller"
+    parts = full_name.strip().split()
+    if len(parts) == 1:
+        return parts[0]
+    return f"{parts[0]} {parts[-1][0]}."
 
 
 def gather_response(prompt_text: str, action_path: str) -> str:
@@ -78,11 +90,14 @@ def empty_state():
         "notes": [],
     }
 
+
+# ── CHANGED: async def + CallSid param
 @router.post("/incoming")
-def incoming_call(
+async def incoming_call(
     session: Session = Depends(get_session),
     From: str = Form(default=""),
     To: str = Form(default=""),
+    CallSid: str = Form(default=""),  # ← NEW
 ):
     """Handle initial inbound call webhook and start first Gather prompt."""
     statement = select(Business).where(Business.twilio_number == To)
@@ -104,11 +119,19 @@ def incoming_call(
 
     normalized_from = normalize_number(From)
     if normalized_from:
-        # Seed state so each subsequent /collect turn can merge extracted fields.
         CALL_STATE[normalized_from] = {
             **empty_state(),
             "business_id": business.id,
         }
+
+    # ── NEW: light up "Call in Progress" banner on demo page
+    asyncio.create_task(manager.broadcast({
+        "type": "call_started",
+        "data": {
+            "call_sid": CallSid,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    }))
 
     greeting = (
         config.greeting
@@ -121,8 +144,10 @@ def incoming_call(
         media_type="application/xml",
     )
 
+
+# ── CHANGED: async def
 @router.post("/collect")
-def collect_turn(
+async def collect_turn(
     session: Session = Depends(get_session),
     From: str = Form(default=""),
     SpeechResult: str = Form(default=""),
@@ -137,10 +162,7 @@ def collect_turn(
     if normalized_from not in CALL_STATE:
         print("WARNING: Missing CALL_STATE for", normalized_from)
         response = VoiceResponse()
-        fallback_message = "Sorry, something went wrong. Please call back."
-        
-        response.say(fallback_message)
-
+        response.say("Sorry, something went wrong. Please call back.")
         response.hangup()
         return Response(content=str(response), media_type="application/xml")
 
@@ -149,7 +171,6 @@ def collect_turn(
     result = analyze_customer_turn(SpeechResult)
     print("RESULT:", result)
 
-    # Merge AI extraction with previously collected state.
     state["caller_name"] = merge_field(state["caller_name"], result.get("caller_name"))
     state["intent"] = merge_field(state["intent"], result.get("intent", "booking"))
     state["service_requested"] = merge_field(state["service_requested"], result.get("service_requested"))
@@ -181,7 +202,6 @@ def collect_turn(
 
     missing_field = get_first_missing_required_field(config, state)
     if missing_field:
-        # Ask only for the next required field to keep conversation focused.
         prompt = get_prompt_for_field(config, missing_field)
         return Response(
             content=gather_response(prompt, "/voice/collect"),
@@ -210,6 +230,18 @@ def collect_turn(
         response.say("Something went wrong saving your request. Please try again.")
         response.hangup()
         return Response(content=str(response), media_type="application/xml")
+
+    # ── NEW: push lead to demo page watchers (masked for privacy)
+    asyncio.create_task(manager.broadcast({
+        "type": "new_lead",
+        "data": {
+            "name": _display_name(lead.caller_name),
+            "phone": lead.phone_number or "",
+            "service": lead.service_requested or "Inquiry",
+            "preferred_time": lead.preferred_time or "",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    }))
 
     customer_text = (
         f"Hey {lead.caller_name or ''}! We got your request for a "
@@ -248,7 +280,7 @@ def collect_turn(
     completion_message = (
         config.completion_message
         if config and config.completion_message
-        else "Perfect, I’ve got everything I need. I’ll pass this along and they’ll take care of you. Talk soon."
+        else "Perfect, I've got everything I need. I'll pass this along and they'll take care of you. Talk soon."
     )
 
     response = VoiceResponse()
@@ -262,6 +294,7 @@ def collect_turn(
         response.say(completion_message)
     response.hangup()
     return Response(content=str(response), media_type="application/xml")
+
 
 @router.get("/audio/{audio_id}.mp3")
 def serve_audio(audio_id: str):
