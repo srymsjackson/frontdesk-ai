@@ -34,8 +34,8 @@ def full_url(path: str) -> str:
     """Build absolute callback URLs Twilio can post back to."""
     return f"{settings.base_url.rstrip('/')}{path}"
 
-# ── NEW: masks caller name for demo page (e.g. "Jackson Strazzo" → "Jackson S.")
 def _display_name(full_name: str | None) -> str:
+    """Format 'Jackson Strazzo' → 'Jackson S.' for demo privacy."""
     if not full_name:
         return "Unknown Caller"
     parts = full_name.strip().split()
@@ -63,7 +63,6 @@ def gather_response(prompt_text: str, action_path: str) -> str:
         if audio_id:
             gather.play(full_url(f"/voice/audio/{audio_id}.mp3"))
         else:
-            # Generation failed; fall back to Twilio's built-in voice.
             gather.say(prompt_text)
     else:
         gather.say(prompt_text)
@@ -91,13 +90,12 @@ def empty_state():
     }
 
 
-# ── CHANGED: async def + CallSid param
 @router.post("/incoming")
 async def incoming_call(
     session: Session = Depends(get_session),
     From: str = Form(default=""),
     To: str = Form(default=""),
-    CallSid: str = Form(default=""),  # ← NEW
+    CallSid: str = Form(default=""),
 ):
     """Handle initial inbound call webhook and start first Gather prompt."""
     statement = select(Business).where(Business.twilio_number == To)
@@ -124,7 +122,6 @@ async def incoming_call(
             "business_id": business.id,
         }
 
-    # ── NEW: light up "Call in Progress" banner on demo page
     asyncio.create_task(manager.broadcast({
         "type": "call_started",
         "data": {
@@ -145,7 +142,6 @@ async def incoming_call(
     )
 
 
-# ── CHANGED: async def
 @router.post("/collect")
 async def collect_turn(
     session: Session = Depends(get_session),
@@ -168,9 +164,12 @@ async def collect_turn(
 
     state = CALL_STATE[normalized_from]
 
-    result = analyze_customer_turn(SpeechResult)
+    # Pass current state so the AI knows what's already collected and generates
+    # the right next question — assistant_reply is now used directly as the prompt.
+    result = analyze_customer_turn(SpeechResult, state)
     print("RESULT:", result)
 
+    # Merge extracted fields into state.
     state["caller_name"] = merge_field(state["caller_name"], result.get("caller_name"))
     state["intent"] = merge_field(state["intent"], result.get("intent", "booking"))
     state["service_requested"] = merge_field(state["service_requested"], result.get("service_requested"))
@@ -200,9 +199,24 @@ async def collect_turn(
     print("STATE:", state)
     print("BUSINESS:", business)
 
+    if not result.get("enough_to_complete"):
+        # AI says we still need more info — use its natural reply directly.
+        # Fall back to config prompt only if assistant_reply is somehow empty.
+        prompt = result.get("assistant_reply")
+        if not prompt:
+            missing_field = get_first_missing_required_field(config, state)
+            prompt = get_prompt_for_field(config, missing_field) if missing_field else "What else can I help you with?"
+        return Response(
+            content=gather_response(prompt, "/voice/collect"),
+            media_type="application/xml",
+        )
+
+    # AI says enough_to_complete — safety check before saving to make sure
+    # required fields are actually present.
     missing_field = get_first_missing_required_field(config, state)
     if missing_field:
-        prompt = get_prompt_for_field(config, missing_field)
+        print(f"AI said complete but {missing_field} is missing — asking for it")
+        prompt = result.get("assistant_reply") or get_prompt_for_field(config, missing_field)
         return Response(
             content=gather_response(prompt, "/voice/collect"),
             media_type="application/xml",
@@ -231,7 +245,6 @@ async def collect_turn(
         response.hangup()
         return Response(content=str(response), media_type="application/xml")
 
-    # ── NEW: push lead to demo page watchers (masked for privacy)
     asyncio.create_task(manager.broadcast({
         "type": "new_lead",
         "data": {

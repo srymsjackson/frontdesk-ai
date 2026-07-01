@@ -25,7 +25,7 @@ with Session(engine) as session:
     # Stores prompt wording and required field policy used by /voice flow.
     config = BusinessConfig(
         business_id=business.id,
-        greeting="Hi, this is Test Barber Shop. Everyone is with clients right now, but I can help. What can I get you today?",
+        greeting="Shaky Razor how can I help you?",
         fallback_message="Sorry, something went wrong. Please call back in a few minutes.",
         completion_message="Perfect, I’ve got everything I need. The shop will follow up with you soon.",
         required_fields_json='["caller_name", "service_requested", "preferred_time"]',
