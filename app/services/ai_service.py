@@ -7,34 +7,23 @@ from app.config import settings
 
 client = OpenAI(api_key=settings.openai_api_key)
 
-SYSTEM_PROMPT = """
-You are a highly natural, friendly receptionist for a modern barbershop.
+# Base prompt — state context is injected per-call in _build_system_prompt()
+_SYSTEM_PROMPT_BASE = """
+You are a friendly, casual receptionist for a barbershop taking a booking over the phone.
 
-You speak casually, like a real human, not robotic.
+Your job each turn:
+1. Extract any booking info from what the caller just said
+2. Write a short, natural reply that acknowledges what they said and asks for the NEXT missing piece
+3. Never re-ask for information already listed under "Already collected"
+4. Set enough_to_complete to true only when ALL required fields are filled
 
-Your job:
-- understand what the caller wants
-- ask for missing booking details naturally
-- extract clean structured booking data
-
-Important:
-- If the caller gives a name, put it in caller_name
-- If the caller gives a service, put it in service_requested
-- If the caller gives a barber preference, put it in preferred_barber
-- If the caller gives a time or day, put it in preferred_time
-- If a field is missing, set it to null
-- Never invent information
+Rules for assistant_reply:
+- 1-2 sentences max
+- One question per turn, never two
+- Sound like a real person, not a script
 - Never say the appointment is confirmed or booked
 
-Keep assistant_reply:
-- short
-- conversational
-- one question at a time
-
-Return ONLY valid JSON.
-No markdown.
-No explanation.
-No extra text.
+Return ONLY valid JSON. No markdown. No explanation. No extra text.
 
 JSON schema:
 {
@@ -47,6 +36,37 @@ JSON schema:
   "enough_to_complete": true or false
 }
 """.strip()
+
+
+def _build_system_prompt(state: dict) -> str:
+    """Inject current booking state into the system prompt so the AI knows
+    what's already collected and what to ask for next."""
+    collected = []
+    if state.get("caller_name"):
+        collected.append(f"Name: {state['caller_name']}")
+    if state.get("service_requested"):
+        collected.append(f"Service: {state['service_requested']}")
+    if state.get("preferred_time"):
+        collected.append(f"Time: {state['preferred_time']}")
+    if state.get("preferred_barber"):
+        collected.append(f"Barber: {state['preferred_barber']}")
+
+    needed = []
+    if not state.get("caller_name"):
+        needed.append("caller name")
+    if not state.get("service_requested"):
+        needed.append("service requested")
+    if not state.get("preferred_time"):
+        needed.append("preferred day and time")
+
+    collected_str = ", ".join(collected) if collected else "nothing yet"
+    needed_str = ", ".join(needed) if needed else "none — set enough_to_complete to true"
+
+    return (
+        f"{_SYSTEM_PROMPT_BASE}\n\n"
+        f"Already collected: {collected_str}\n"
+        f"Still needed: {needed_str}"
+    )
 
 
 def fallback_response():
@@ -178,13 +198,21 @@ def extract_json(raw_text: str) -> dict | None:
     return None
 
 
-def analyze_customer_turn(user_text: str) -> dict:
-    """Call the model and return a cleaned structured booking state update."""
+def analyze_customer_turn(user_text: str, state: dict | None = None) -> dict:
+    """Call the model and return a cleaned structured booking state update.
+
+    state — the already-collected fields from previous turns. Passed into the
+    system prompt so the AI knows what to ask for next and doesn't re-ask for
+    things already collected. assistant_reply in the response is now safe to
+    use directly as the next prompt.
+    """
+    current_state = state or {}
+
     try:
         response = client.responses.create(
             model=settings.openai_model,
             input=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": _build_system_prompt(current_state)},
                 {"role": "user", "content": user_text},
             ],
         )
