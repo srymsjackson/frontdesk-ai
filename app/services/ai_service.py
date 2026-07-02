@@ -7,21 +7,34 @@ from app.config import settings
 
 client = OpenAI(api_key=settings.openai_api_key)
 
-# Base prompt — state context is injected per-call in _build_system_prompt()
 _SYSTEM_PROMPT_BASE = """
 You are a friendly, casual receptionist for a barbershop taking a booking over the phone.
 
+REQUIRED fields (all 3 must be collected before completing):
+  1. caller_name
+  2. service_requested
+  3. preferred_time — must include BOTH a day AND a time (e.g. "Thursday at 2pm")
+
+OPTIONAL field (never ask for it, never let it block completion):
+  - preferred_barber
+
 Your job each turn:
 1. Extract any booking info from what the caller just said
-2. Write a short, natural reply that acknowledges what they said and asks for the NEXT missing piece
-3. Never re-ask for information already listed under "Already collected"
-4. Set enough_to_complete to true only when ALL required fields are filled
+2. Write a short, natural reply that acknowledges what they said and asks for the NEXT missing required field
+3. Never re-ask for anything already listed under "Already collected"
+4. Set enough_to_complete to true as soon as all 3 required fields are filled
+
+Time combination rule — IMPORTANT:
+  If "Already collected" shows a time but no day (e.g. "Time: 2:00 pm"), and the caller gives a day
+  (e.g. "Thursday"), combine them: output preferred_time as "Thursday at 2:00 pm".
+  Never split day and time into separate turns.
 
 Rules for assistant_reply:
 - 1-2 sentences max
 - One question per turn, never two
 - Sound like a real person, not a script
 - Never say the appointment is confirmed or booked
+- Never ask about barber preference
 
 Return ONLY valid JSON. No markdown. No explanation. No extra text.
 
@@ -39,8 +52,6 @@ JSON schema:
 
 
 def _build_system_prompt(state: dict) -> str:
-    """Inject current booking state into the system prompt so the AI knows
-    what's already collected and what to ask for next."""
     collected = []
     if state.get("caller_name"):
         collected.append(f"Name: {state['caller_name']}")
@@ -48,8 +59,6 @@ def _build_system_prompt(state: dict) -> str:
         collected.append(f"Service: {state['service_requested']}")
     if state.get("preferred_time"):
         collected.append(f"Time: {state['preferred_time']}")
-    if state.get("preferred_barber"):
-        collected.append(f"Barber: {state['preferred_barber']}")
 
     needed = []
     if not state.get("caller_name"):
@@ -57,10 +66,10 @@ def _build_system_prompt(state: dict) -> str:
     if not state.get("service_requested"):
         needed.append("service requested")
     if not state.get("preferred_time"):
-        needed.append("preferred day and time")
+        needed.append("preferred day AND time (get both in one answer if possible)")
 
     collected_str = ", ".join(collected) if collected else "nothing yet"
-    needed_str = ", ".join(needed) if needed else "none — set enough_to_complete to true"
+    needed_str = ", ".join(needed) if needed else "none — set enough_to_complete to true NOW"
 
     return (
         f"{_SYSTEM_PROMPT_BASE}\n\n"
@@ -70,10 +79,9 @@ def _build_system_prompt(state: dict) -> str:
 
 
 def fallback_response():
-    """Baseline response shape used when AI output is unavailable or invalid."""
     return {
         "intent": "booking",
-        "assistant_reply": "Got you — what time were you thinking?",
+        "assistant_reply": "Got you — what day and time were you thinking?",
         "caller_name": None,
         "service_requested": None,
         "preferred_barber": None,
@@ -83,11 +91,9 @@ def fallback_response():
 
 
 def clean_service(service):
-    """Normalize free-text service names into simple canonical labels."""
     if not service:
         return None
     s = service.lower().strip()
-
     if "fade" in s:
         return "fade"
     if "beard" in s:
@@ -96,19 +102,16 @@ def clean_service(service):
         return "trim"
     if "haircut" in s or "hair cut" in s or "cut" in s:
         return "haircut"
-
     return s
 
 
 def clean_time(value):
-    """Normalize time text for easier downstream checks."""
     if not value:
         return None
     return value.replace(".", "").strip().lower()
 
 
 def clean_barber(value):
-    """Normalize barber preference; collapse flexible phrasing to 'no preference'."""
     if not value:
         return None
     v = value.strip().lower()
@@ -118,14 +121,12 @@ def clean_barber(value):
 
 
 def clean_name(value):
-    """Title-case and trim names for cleaner display/storage."""
     if not value:
         return None
     return value.strip().title()
 
 
 def fallback_extract_name(text: str):
-    """Regex fallback name extraction when model output is missing fields."""
     patterns = [
         r"my name is ([A-Za-z]+)",
         r"my name's ([A-Za-z]+)",
@@ -139,7 +140,6 @@ def fallback_extract_name(text: str):
 
 
 def fallback_extract_barber(text: str):
-    """Regex/phrase fallback for barber preference extraction."""
     lowered = text.lower()
     if (
         "anybody is fine" in lowered
@@ -152,7 +152,6 @@ def fallback_extract_barber(text: str):
 
 
 def fallback_extract_service(text: str):
-    """Keyword fallback for service extraction."""
     lowered = text.lower()
     if "fade" in lowered:
         return "fade"
@@ -166,7 +165,6 @@ def fallback_extract_service(text: str):
 
 
 def fallback_extract_time(text: str):
-    """Regex fallback for specific-ish time expressions."""
     match = re.search(
         r"(tomorrow(?:\s+(?:morning|afternoon|evening|night))?)|"
         r"(around\s+\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))|"
@@ -180,32 +178,22 @@ def fallback_extract_time(text: str):
 
 
 def extract_json(raw_text: str) -> dict | None:
-    """Parse JSON from raw model output, including fenced/mixed text fallback."""
     raw_text = raw_text.strip()
-
     try:
         return json.loads(raw_text)
     except Exception:
         pass
-
     match = re.search(r"\{.*\}", raw_text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(0))
         except Exception:
             return None
-
     return None
 
 
 def analyze_customer_turn(user_text: str, state: dict | None = None) -> dict:
-    """Call the model and return a cleaned structured booking state update.
-
-    state — the already-collected fields from previous turns. Passed into the
-    system prompt so the AI knows what to ask for next and doesn't re-ask for
-    things already collected. assistant_reply in the response is now safe to
-    use directly as the next prompt.
-    """
+    """Call the model and return a cleaned structured booking state update."""
     current_state = state or {}
 
     try:
@@ -227,7 +215,7 @@ def analyze_customer_turn(user_text: str, state: dict | None = None) -> dict:
             data["assistant_reply"] = raw_text or data["assistant_reply"]
 
         data["intent"] = data.get("intent", "booking")
-        data["assistant_reply"] = data.get("assistant_reply", "Got you — what time were you thinking?")
+        data["assistant_reply"] = data.get("assistant_reply", "Got you — what day and time were you thinking?")
         data["caller_name"] = clean_name(data.get("caller_name")) or fallback_extract_name(user_text)
         data["service_requested"] = clean_service(data.get("service_requested")) or fallback_extract_service(user_text)
         data["preferred_barber"] = clean_barber(data.get("preferred_barber")) or fallback_extract_barber(user_text)
