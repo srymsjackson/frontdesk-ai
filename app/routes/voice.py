@@ -199,24 +199,16 @@ async def collect_turn(
     print("STATE:", state)
     print("BUSINESS:", business)
 
-    if not result.get("enough_to_complete"):
-        # AI says we still need more info — use its natural reply directly.
-        # Fall back to config prompt only if assistant_reply is somehow empty.
-        prompt = result.get("assistant_reply")
-        if not prompt:
-            missing_field = get_first_missing_required_field(config, state)
-            prompt = get_prompt_for_field(config, missing_field) if missing_field else "What else can I help you with?"
-        return Response(
-            content=gather_response(prompt, "/voice/collect"),
-            media_type="application/xml",
-        )
+    # Simple inline required-field check — just needs to be non-empty.
+    # Intentionally does NOT do format validation; "tomorrow", "Saturday",
+    # "asap" are all valid enough to save.
+    REQUIRED = ["caller_name", "service_requested", "preferred_time"]
+    first_missing = next((f for f in REQUIRED if not state.get(f)), None)
 
-    # AI says enough_to_complete — safety check before saving to make sure
-    # required fields are actually present.
-    missing_field = get_first_missing_required_field(config, state)
-    if missing_field:
-        print(f"AI said complete but {missing_field} is missing — asking for it")
-        prompt = result.get("assistant_reply") or get_prompt_for_field(config, missing_field)
+    if not result.get("enough_to_complete") or first_missing:
+        if first_missing:
+            print(f"Still missing: {first_missing}")
+        prompt = result.get("assistant_reply") or get_prompt_for_field(config, first_missing)
         return Response(
             content=gather_response(prompt, "/voice/collect"),
             media_type="application/xml",
