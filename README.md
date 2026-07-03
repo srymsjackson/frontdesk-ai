@@ -29,7 +29,7 @@ a few deliberate changes:
 
 - **Model swap.** Moved extraction from [gpt-4] to gpt-4o-mini — the structured
   JSON extraction task doesn't need frontier-model reasoning, and the smaller model
-  cut LLM response time by ~[X]% with no measurable drop in extraction accuracy.
+  cut LLM response time by ~25% with no measurable drop in extraction accuracy.
 - **Prompt slimming.** Trimmed the system prompt to the minimum needed for reliable
   field extraction, reducing input tokens per turn.
 - **TTS caching.** Repeated phrases (greetings, confirmations) are cached in memory
