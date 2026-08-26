@@ -8,3 +8,6 @@ __pycache__/
 .vscode/
 .idea/
 *.log
+.venv/
+.testvenv/
+.pytest_cache/

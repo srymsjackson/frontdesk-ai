@@ -126,16 +126,37 @@ def clean_name(value):
     return value.strip().title()
 
 
+# Words that can follow "this is ..." without being a name. The bare
+# "this is X" pattern is greedy — "this is stupid", "this is ridiculous",
+# etc. would otherwise be parsed as the caller's name. For lead capture a
+# missed name (which the owner can ask about) is far safer than a wrong one,
+# so the fallback stays deliberately conservative.
+_NON_NAME_WORDS = {
+    "stupid", "dumb", "ridiculous", "annoying", "annoyed", "pointless",
+    "useless", "insane", "crazy", "weird", "frustrating", "frustrated",
+    "confused", "upset", "angry", "mad", "done", "here", "calling",
+    "not", "so", "really", "very", "great", "awesome", "terrible",
+    "awful", "bad", "good", "fine", "okay", "ok", "sure",
+    "a", "an", "the", "my", "your", "for", "about", "regarding",
+}
+
+
 def fallback_extract_name(text: str):
+    # Ordered most- to least-explicit. "my name is X" is unambiguous; the
+    # bare "this is X" form is only trusted after the stop-list check below.
     patterns = [
-        r"my name is ([A-Za-z]+)",
-        r"my name's ([A-Za-z]+)",
-        r"this is ([A-Za-z]+)",
+        r"\bmy name is ([A-Za-z]+)",
+        r"\bmy name's ([A-Za-z]+)",
+        r"\bthis is ([A-Za-z]+)",
+        r"\bi'?m ([A-Za-z]+)",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            return match.group(1).title()
+            candidate = match.group(1)
+            if candidate.lower() in _NON_NAME_WORDS:
+                continue
+            return candidate.title()
     return None
 
 
