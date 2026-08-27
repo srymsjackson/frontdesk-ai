@@ -187,14 +187,16 @@ def complete_call(payload: CallCompleteRequest, session: Session = Depends(get_s
 
     try:
         if config and config.send_customer_sms and business.booking_link and settings.twilio_phone_number:
-            # customer_msg = send_sms(lead.phone_number, customer_text)
+            customer_msg = send_sms(lead.phone_number, customer_text)
+            logger.info("Customer SMS sent sid=%s", customer_msg.sid)
             mark_booking_link_sent(session, lead)
     except Exception as e:
         logger.error("Customer SMS failed: %s", e)
 
     try:
         if config and config.send_owner_sms and business.owner_phone and settings.twilio_phone_number:
-            # owner_msg = send_sms(business.owner_phone, owner_text)
+            owner_msg = send_sms(business.owner_phone, owner_text)
+            logger.info("Owner SMS sent sid=%s", owner_msg.sid)
             mark_owner_notified(session, lead)
     except Exception as e:
         logger.error("Owner SMS failed: %s", e)

@@ -18,6 +18,7 @@ from app.config import settings
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from fastapi.responses import Response as FastAPIResponse
 from app.services.voice_service import generate_audio, get_audio
+from app.services.twilio_service import send_sms
 import asyncio
 from datetime import datetime, timezone
 from ..websocket_manager import manager
@@ -264,16 +265,16 @@ async def collect_turn(
 
     try:
         if config and config.send_customer_sms and business.booking_link:
-            # customer_msg = send_sms(lead.phone_number, customer_text)
-            # print("CUSTOMER SMS SID:", customer_msg.sid)
+            customer_msg = send_sms(lead.phone_number, customer_text)
+            logger.info("Customer SMS sent sid=%s", customer_msg.sid)
             mark_booking_link_sent(session, lead)
     except Exception as e:
         logger.error("Customer SMS failed: %s", e)
 
     try:
         if config and config.send_owner_sms and business.owner_phone:
-            # owner_msg = send_sms(business.owner_phone, owner_text)
-            # print("OWNER SMS SID:", owner_msg.sid)
+            owner_msg = send_sms(business.owner_phone, owner_text)
+            logger.info("Owner SMS sent sid=%s", owner_msg.sid)
             mark_owner_notified(session, lead)
     except Exception as e:
         logger.error("Owner SMS failed: %s", e)
