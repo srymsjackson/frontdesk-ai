@@ -1,9 +1,12 @@
 """AI + fallback parsing for extracting structured booking info from caller speech."""
 
 import json
+import logging
 import re
 from openai import OpenAI
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 client = OpenAI(api_key=settings.openai_api_key)
 
@@ -227,11 +230,11 @@ def analyze_customer_turn(user_text: str, state: dict | None = None) -> dict:
         )
 
         raw_text = response.output_text.strip()
-        print("RAW AI RESPONSE:", raw_text)
+        logger.debug("Raw AI response: %s", raw_text)
 
         data = extract_json(raw_text)
         if not data:
-            print("JSON PARSE FAILED")
+            logger.warning("JSON parse failed for AI response: %s", raw_text)
             data = fallback_response()
             data["assistant_reply"] = raw_text or data["assistant_reply"]
 
@@ -243,11 +246,11 @@ def analyze_customer_turn(user_text: str, state: dict | None = None) -> dict:
         data["preferred_time"] = clean_time(data.get("preferred_time")) or fallback_extract_time(user_text)
         data["enough_to_complete"] = bool(data.get("enough_to_complete", False))
 
-        print("CLEANED DATA:", data)
+        logger.debug("Cleaned data: %s", data)
         return data
 
     except Exception as e:
-        print("OPENAI ERROR:", str(e))
+        logger.error("OpenAI call failed: %s", e)
         data = fallback_response()
         data["caller_name"] = fallback_extract_name(user_text)
         data["service_requested"] = fallback_extract_service(user_text)

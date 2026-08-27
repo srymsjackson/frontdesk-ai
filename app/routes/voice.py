@@ -1,5 +1,6 @@
 """Voice webhook endpoints that collect lead details over multi-turn calls."""
 
+import logging
 from fastapi import APIRouter, Depends, Form, Response
 from sqlmodel import Session
 from sqlmodel import select
@@ -20,6 +21,8 @@ from app.services.voice_service import generate_audio, get_audio
 import asyncio
 from datetime import datetime, timezone
 from ..websocket_manager import manager
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/voice", tags=["voice"])
 
@@ -101,11 +104,8 @@ async def incoming_call(
     statement = select(Business).where(Business.twilio_number == To)
     business = session.exec(statement).first()
 
-    print("INCOMING HIT")
-    print("From:", From)
-    print("To:", To)
-    print("BASE_URL:", settings.base_url)
-    print("COLLECT URL:", full_url("/voice/collect"))
+    logger.info("Incoming call from=%s to=%s", From, To)
+    logger.debug("base_url=%s collect_url=%s", settings.base_url, full_url("/voice/collect"))
 
     if not business:
         response = VoiceResponse()
@@ -149,14 +149,12 @@ async def collect_turn(
     SpeechResult: str = Form(default=""),
 ):
     """Handle each spoken customer turn and decide ask-next vs. complete."""
-    print("COLLECT HIT")
-    print("From:", From)
-    print("SpeechResult:", SpeechResult)
+    logger.debug("Collect turn from=%s speech=%r", From, SpeechResult)
 
     normalized_from = normalize_number(From)
 
     if normalized_from not in CALL_STATE:
-        print("WARNING: Missing CALL_STATE for", normalized_from)
+        logger.warning("Missing CALL_STATE for %s", normalized_from)
         response = VoiceResponse()
         response.say("Sorry, something went wrong. Please call back.")
         response.hangup()
@@ -167,7 +165,7 @@ async def collect_turn(
     # Pass current state so the AI knows what's already collected and generates
     # the right next question — assistant_reply is now used directly as the prompt.
     result = analyze_customer_turn(SpeechResult, state)
-    print("RESULT:", result)
+    logger.debug("Analyze result: %s", result)
 
     # Merge extracted fields into state.
     state["caller_name"] = merge_field(state["caller_name"], result.get("caller_name"))
@@ -196,8 +194,8 @@ async def collect_turn(
 
     config = get_business_config(session, business.id)
 
-    print("STATE:", state)
-    print("BUSINESS:", business)
+    logger.debug("State: %s", state)
+    logger.debug("Business: %s", business)
 
     # Simple inline required-field check — just needs to be non-empty.
     # Intentionally does NOT do format validation; "tomorrow", "Saturday",
@@ -207,7 +205,7 @@ async def collect_turn(
 
     if not result.get("enough_to_complete") or first_missing:
         if first_missing:
-            print(f"Still missing: {first_missing}")
+            logger.debug("Still missing: %s", first_missing)
         prompt = result.get("assistant_reply") or get_prompt_for_field(config, first_missing)
         return Response(
             content=gather_response(prompt, "/voice/collect"),
@@ -231,7 +229,7 @@ async def collect_turn(
             ),
         )
     except Exception as e:
-        print("LEAD CREATION ERROR:", str(e))
+        logger.error("Lead creation failed: %s", e)
         response = VoiceResponse()
         response.say("Something went wrong saving your request. Please try again.")
         response.hangup()
@@ -270,7 +268,7 @@ async def collect_turn(
             # print("CUSTOMER SMS SID:", customer_msg.sid)
             mark_booking_link_sent(session, lead)
     except Exception as e:
-        print("CUSTOMER SMS ERROR:", str(e))
+        logger.error("Customer SMS failed: %s", e)
 
     try:
         if config and config.send_owner_sms and business.owner_phone:
@@ -278,7 +276,7 @@ async def collect_turn(
             # print("OWNER SMS SID:", owner_msg.sid)
             mark_owner_notified(session, lead)
     except Exception as e:
-        print("OWNER SMS ERROR:", str(e))
+        logger.error("Owner SMS failed: %s", e)
 
     CALL_STATE.pop(normalized_from, None)
 

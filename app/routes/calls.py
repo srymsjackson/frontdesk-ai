@@ -1,3 +1,4 @@
+import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Session, select
@@ -20,6 +21,8 @@ from app.services.lead_service import (
 )
 from app.services.twilio_service import send_sms
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/calls", tags=["calls"])
 
@@ -187,14 +190,14 @@ def complete_call(payload: CallCompleteRequest, session: Session = Depends(get_s
             # customer_msg = send_sms(lead.phone_number, customer_text)
             mark_booking_link_sent(session, lead)
     except Exception as e:
-        print("CUSTOMER SMS ERROR:", str(e))
+        logger.error("Customer SMS failed: %s", e)
 
     try:
         if config and config.send_owner_sms and business.owner_phone and settings.twilio_phone_number:
             # owner_msg = send_sms(business.owner_phone, owner_text)
             mark_owner_notified(session, lead)
     except Exception as e:
-        print("OWNER SMS ERROR:", str(e))
+        logger.error("Owner SMS failed: %s", e)
 
     completion_message = (
         config.completion_message

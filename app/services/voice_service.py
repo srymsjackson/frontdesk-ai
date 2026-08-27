@@ -1,11 +1,14 @@
 """ElevenLabs text-to-speech service with simple in-memory audio cache."""
 
+import logging
 import uuid
 import time
 import threading
 from typing import Optional
 from elevenlabs.client import ElevenLabs
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 # In-memory cache: { audio_id: (audio_bytes, created_at_epoch) }
 # Keeps audio for ~5 min, plenty of time for Twilio to fetch + play.
@@ -54,11 +57,11 @@ def generate_audio(text: str) -> Optional[str]:
             _evict_expired()
             _audio_cache[audio_id] = (audio_bytes, time.time())
 
-        print(f"ELEVENLABS GENERATED audio_id={audio_id} bytes={len(audio_bytes)}")
+        logger.info("ElevenLabs audio generated audio_id=%s bytes=%d", audio_id, len(audio_bytes))
         return audio_id
 
     except Exception as e:
-        print("ELEVENLABS ERROR:", str(e))
+        logger.error("ElevenLabs generation failed: %s", e)
         return None
 
 

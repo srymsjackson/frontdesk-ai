@@ -1,13 +1,16 @@
 """Lead persistence operations used by API routes."""
 
+import logging
 from sqlmodel import Session, select
 from app.models import Lead
 from app.schemas import LeadCreate
 
+logger = logging.getLogger(__name__)
+
 
 def create_lead(session: Session, payload: LeadCreate) -> Lead:
     """Insert a lead row and return the refreshed database object."""
-    print("LEAD PAYLOAD DUMP:", payload.model_dump())
+    logger.debug("Creating lead: %s", payload.model_dump())
     lead = Lead(**payload.model_dump())
     session.add(lead)
     session.commit()

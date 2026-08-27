@@ -1,0 +1,370 @@
+diff --git a/app/prompts.py b/app/prompts.py
+deleted file mode 100644
+index c5d854c..0000000
+--- a/app/prompts.py
++++ /dev/null
+@@ -1,120 +0,0 @@
+-"""
+-prompts.py
+----
+-Optimized system prompts for the AI receptionist.
+-
+-Key changes from a naive prompt:
+-  1. Much shorter — fewer tokens = faster OpenAI inference (~200-400ms saved per turn)
+-  2. One-question-per-turn rule enforced explicitly — reduces multi-question
+-     responses that confuse callers and extend calls unnecessarily
+-  3. No repetition of what the caller just said — a common LLM habit that
+-     sounds robotic and wastes time
+-  4. Hard length limit on responses — 2 sentences max keeps audio short
+-     (less ElevenLabs latency) and sounds like a real receptionist, not a chatbot
+-  5. Clear terminal condition — the AI knows exactly when to wrap up
+-
+-Usage:
+-    from app.prompts import build_system_prompt
+-
+-    system_prompt = build_system_prompt(
+-        business_name="The Shaky Razor",
+-        services=["Haircut", "Beard Trim", "Haircut & Beard", "Fade", "Kids Cut"],
+-        owner_phone="(435) 555-0100",
+-        collected=state.collected_info,   # dict of what we have so far
+-    )
+-"""
+-
+-from typing import Optional
+-
+-
+-def build_system_prompt(
+-    business_name: str,
+-    services: list[str],
+-    owner_phone: str,
+-    collected: Optional[dict] = None,
+-) -> str:
+-    services_str = ", ".join(services) if services else "various services"
+-
+-    collected_str = "Nothing yet."
+-    if collected:
+-        parts = []
+-        if collected.get("name"):
+-            parts.append(f"Name: {collected['name']}")
+-        if collected.get("phone"):
+-            parts.append(f"Phone: {collected['phone']}")
+-        if collected.get("service"):
+-            parts.append(f"Service: {collected['service']}")
+-        if collected.get("preferred_time"):
+-            parts.append(f"Time: {collected['preferred_time']}")
+-        if parts:
+-            collected_str = " · ".join(parts)
+-
+-    # What we still need — used to keep the AI on track
+-    needs = []
+-    c = collected or {}
+-    if not c.get("name"):
+-        needs.append("name")
+-    if not c.get("phone"):
+-        needs.append("callback phone number")
+-    if not c.get("service"):
+-        needs.append(f"which service ({services_str})")
+-    if not c.get("preferred_time"):
+-        needs.append("preferred day and time")
+-
+-    if needs:
+-        next_ask = f"Ask for their {needs[0]} next."
+-    else:
+-        next_ask = (
+-            "You have everything. Confirm the booking by reading back all 4 details "
+-            "and tell them someone will follow up to confirm. Then end warmly."
+-        )
+-
+-    return f"""You are the AI receptionist for {business_name}. Your only job: collect booking info and make callers feel taken care of.
+-
+-COLLECT (one at a time, in any natural order):
+-• Name
+-• Callback phone number
+-• Service — options: {services_str}
+-• Preferred day and time
+-
+-RULES — follow these strictly:
+-• 2 sentences max per response. Never longer.
+-• One question per turn. Never ask two things at once.
+-• Don't repeat what the caller just said. Acknowledge briefly and move on.
+-• Don't describe what you're doing ("I'll collect your information..."). Just do it.
+-• If they ask about price, wait times, or anything operational: "For that, it's best to reach us directly at {owner_phone} — but I can get you booked right now if you'd like."
+-• Never make up availability or pricing.
+-
+-CURRENT INFO COLLECTED: {collected_str}
+-
+-NEXT ACTION: {next_ask}"""
+-
+-
+-# ── Pre-generated opening greeting ──────────────────────────────────────────
+-# This is the one response you CAN cache as ElevenLabs audio.
+-# Pre-generate it on startup and serve as a static file → zero TTS latency
+-# on first turn.
+-
+-def build_greeting(business_name: str) -> str:
+-    return (
+-        f"Thanks for calling {business_name}! "
+-        f"I'm an AI receptionist — I can get you booked in about 30 seconds. "
+-        f"What's your name?"
+-    )
+-
+-
+-# ── Barbershop-specific defaults ─────────────────────────────────────────────
+-# Import these in your Business seeding script or use as fallbacks.
+-
+-SHAKY_RAZOR_DEFAULTS = {
+-    "business_name": "The Shaky Razor",
+-    "services": [
+-        "Haircut",
+-        "Beard Trim",
+-        "Haircut & Beard Trim",
+-        "Fade",
+-        "Kids Cut",
+-        "Hot Towel Shave",
+-    ],
+-    "owner_phone": "(435) xxx-xxxx",  # fill in real number
+-}
+diff --git a/app/routes/calls.py b/app/routes/calls.py
+index b8f4c2f..3b56f6f 100644
+--- a/app/routes/calls.py
++++ b/app/routes/calls.py
+@@ -1,3 +1,4 @@
++import logging
+ from fastapi import APIRouter, Depends, HTTPException
+ from pydantic import BaseModel
+ from sqlmodel import Session, select
+@@ -21,6 +22,8 @@ from app.services.lead_service import (
+ from app.services.twilio_service import send_sms
+ from app.config import settings
+ 
++logger = logging.getLogger(__name__)
++
+ router = APIRouter(prefix="/api/calls", tags=["calls"])
+ 
+ class CallInitRequest(BaseModel):
+@@ -187,14 +190,14 @@ def complete_call(payload: CallCompleteRequest, session: Session = Depends(get_s
+             # customer_msg = send_sms(lead.phone_number, customer_text)
+             mark_booking_link_sent(session, lead)
+     except Exception as e:
+-        print("CUSTOMER SMS ERROR:", str(e))
++        logger.error("Customer SMS failed: %s", e)
+ 
+     try:
+         if config and config.send_owner_sms and business.owner_phone and settings.twilio_phone_number:
+             # owner_msg = send_sms(business.owner_phone, owner_text)
+             mark_owner_notified(session, lead)
+     except Exception as e:
+-        print("OWNER SMS ERROR:", str(e))
++        logger.error("Owner SMS failed: %s", e)
+ 
+     completion_message = (
+         config.completion_message
+diff --git a/app/routes/voice.py b/app/routes/voice.py
+index 778c50e..6c6a0ba 100644
+--- a/app/routes/voice.py
++++ b/app/routes/voice.py
+@@ -1,5 +1,6 @@
+ """Voice webhook endpoints that collect lead details over multi-turn calls."""
+ 
++import logging
+ from fastapi import APIRouter, Depends, Form, Response
+ from sqlmodel import Session
+ from sqlmodel import select
+@@ -21,6 +22,8 @@ import asyncio
+ from datetime import datetime, timezone
+ from ..websocket_manager import manager
+ 
++logger = logging.getLogger(__name__)
++
+ router = APIRouter(prefix="/voice", tags=["voice"])
+ 
+ # In-memory per-caller state for a single process instance.
+@@ -101,11 +104,8 @@ async def incoming_call(
+     statement = select(Business).where(Business.twilio_number == To)
+     business = session.exec(statement).first()
+ 
+-    print("INCOMING HIT")
+-    print("From:", From)
+-    print("To:", To)
+-    print("BASE_URL:", settings.base_url)
+-    print("COLLECT URL:", full_url("/voice/collect"))
++    logger.info("Incoming call from=%s to=%s", From, To)
++    logger.debug("base_url=%s collect_url=%s", settings.base_url, full_url("/voice/collect"))
+ 
+     if not business:
+         response = VoiceResponse()
+@@ -149,14 +149,12 @@ async def collect_turn(
+     SpeechResult: str = Form(default=""),
+ ):
+     """Handle each spoken customer turn and decide ask-next vs. complete."""
+-    print("COLLECT HIT")
+-    print("From:", From)
+-    print("SpeechResult:", SpeechResult)
++    logger.debug("Collect turn from=%s speech=%r", From, SpeechResult)
+ 
+     normalized_from = normalize_number(From)
+ 
+     if normalized_from not in CALL_STATE:
+-        print("WARNING: Missing CALL_STATE for", normalized_from)
++        logger.warning("Missing CALL_STATE for %s", normalized_from)
+         response = VoiceResponse()
+         response.say("Sorry, something went wrong. Please call back.")
+         response.hangup()
+@@ -167,7 +165,7 @@ async def collect_turn(
+     # Pass current state so the AI knows what's already collected and generates
+     # the right next question — assistant_reply is now used directly as the prompt.
+     result = analyze_customer_turn(SpeechResult, state)
+-    print("RESULT:", result)
++    logger.debug("Analyze result: %s", result)
+ 
+     # Merge extracted fields into state.
+     state["caller_name"] = merge_field(state["caller_name"], result.get("caller_name"))
+@@ -196,8 +194,8 @@ async def collect_turn(
+ 
+     config = get_business_config(session, business.id)
+ 
+-    print("STATE:", state)
+-    print("BUSINESS:", business)
++    logger.debug("State: %s", state)
++    logger.debug("Business: %s", business)
+ 
+     # Simple inline required-field check — just needs to be non-empty.
+     # Intentionally does NOT do format validation; "tomorrow", "Saturday",
+@@ -207,7 +205,7 @@ async def collect_turn(
+ 
+     if not result.get("enough_to_complete") or first_missing:
+         if first_missing:
+-            print(f"Still missing: {first_missing}")
++            logger.debug("Still missing: %s", first_missing)
+         prompt = result.get("assistant_reply") or get_prompt_for_field(config, first_missing)
+         return Response(
+             content=gather_response(prompt, "/voice/collect"),
+@@ -231,7 +229,7 @@ async def collect_turn(
+             ),
+         )
+     except Exception as e:
+-        print("LEAD CREATION ERROR:", str(e))
++        logger.error("Lead creation failed: %s", e)
+         response = VoiceResponse()
+         response.say("Something went wrong saving your request. Please try again.")
+         response.hangup()
+@@ -270,7 +268,7 @@ async def collect_turn(
+             # print("CUSTOMER SMS SID:", customer_msg.sid)
+             mark_booking_link_sent(session, lead)
+     except Exception as e:
+-        print("CUSTOMER SMS ERROR:", str(e))
++        logger.error("Customer SMS failed: %s", e)
+ 
+     try:
+         if config and config.send_owner_sms and business.owner_phone:
+@@ -278,7 +276,7 @@ async def collect_turn(
+             # print("OWNER SMS SID:", owner_msg.sid)
+             mark_owner_notified(session, lead)
+     except Exception as e:
+-        print("OWNER SMS ERROR:", str(e))
++        logger.error("Owner SMS failed: %s", e)
+ 
+     CALL_STATE.pop(normalized_from, None)
+ 
+diff --git a/app/services/ai_service.py b/app/services/ai_service.py
+index e3fbe98..70ea742 100644
+--- a/app/services/ai_service.py
++++ b/app/services/ai_service.py
+@@ -1,10 +1,13 @@
+ """AI + fallback parsing for extracting structured booking info from caller speech."""
+ 
+ import json
++import logging
+ import re
+ from openai import OpenAI
+ from app.config import settings
+ 
++logger = logging.getLogger(__name__)
++
+ client = OpenAI(api_key=settings.openai_api_key)
+ 
+ _SYSTEM_PROMPT_BASE = """
+@@ -227,11 +230,11 @@ def analyze_customer_turn(user_text: str, state: dict | None = None) -> dict:
+         )
+ 
+         raw_text = response.output_text.strip()
+-        print("RAW AI RESPONSE:", raw_text)
++        logger.debug("Raw AI response: %s", raw_text)
+ 
+         data = extract_json(raw_text)
+         if not data:
+-            print("JSON PARSE FAILED")
++            logger.warning("JSON parse failed for AI response: %s", raw_text)
+             data = fallback_response()
+             data["assistant_reply"] = raw_text or data["assistant_reply"]
+ 
+@@ -243,11 +246,11 @@ def analyze_customer_turn(user_text: str, state: dict | None = None) -> dict:
+         data["preferred_time"] = clean_time(data.get("preferred_time")) or fallback_extract_time(user_text)
+         data["enough_to_complete"] = bool(data.get("enough_to_complete", False))
+ 
+-        print("CLEANED DATA:", data)
++        logger.debug("Cleaned data: %s", data)
+         return data
+ 
+     except Exception as e:
+-        print("OPENAI ERROR:", str(e))
++        logger.error("OpenAI call failed: %s", e)
+         data = fallback_response()
+         data["caller_name"] = fallback_extract_name(user_text)
+         data["service_requested"] = fallback_extract_service(user_text)
+diff --git a/app/services/lead_service.py b/app/services/lead_service.py
+index 6a12d02..6c7c411 100644
+--- a/app/services/lead_service.py
++++ b/app/services/lead_service.py
+@@ -1,13 +1,16 @@
+ """Lead persistence operations used by API routes."""
+ 
++import logging
+ from sqlmodel import Session, select
+ from app.models import Lead
+ from app.schemas import LeadCreate
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ def create_lead(session: Session, payload: LeadCreate) -> Lead:
+     """Insert a lead row and return the refreshed database object."""
+-    print("LEAD PAYLOAD DUMP:", payload.model_dump())
++    logger.debug("Creating lead: %s", payload.model_dump())
+     lead = Lead(**payload.model_dump())
+     session.add(lead)
+     session.commit()
+diff --git a/app/services/voice_service.py b/app/services/voice_service.py
+index 8efd990..9ff3150 100644
+--- a/app/services/voice_service.py
++++ b/app/services/voice_service.py
+@@ -1,5 +1,6 @@
+ """ElevenLabs text-to-speech service with simple in-memory audio cache."""
+ 
++import logging
+ import uuid
+ import time
+ import threading
+@@ -7,6 +8,8 @@ from typing import Optional
+ from elevenlabs.client import ElevenLabs
+ from app.config import settings
+ 
++logger = logging.getLogger(__name__)
++
+ # In-memory cache: { audio_id: (audio_bytes, created_at_epoch) }
+ # Keeps audio for ~5 min, plenty of time for Twilio to fetch + play.
+ _audio_cache: dict[str, tuple[bytes, float]] = {}
+@@ -54,11 +57,11 @@ def generate_audio(text: str) -> Optional[str]:
+             _evict_expired()
+             _audio_cache[audio_id] = (audio_bytes, time.time())
+ 
+-        print(f"ELEVENLABS GENERATED audio_id={audio_id} bytes={len(audio_bytes)}")
++        logger.info("ElevenLabs audio generated audio_id=%s bytes=%d", audio_id, len(audio_bytes))
+         return audio_id
+ 
+     except Exception as e:
+-        print("ELEVENLABS ERROR:", str(e))
++        logger.error("ElevenLabs generation failed: %s", e)
+         return None
+ 
+ 
