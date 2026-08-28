@@ -33,6 +33,22 @@ os.environ.setdefault("DASHBOARD_KEY", "test-dashboard-key-not-a-real-secret")
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_limits():
+    """Every test starts with a clean rate-limit counter, regardless of what
+    other tests (in this file or others) hit before it.
+
+    This is global (conftest.py, not a single test module) because the
+    slowapi Limiter is a module-level singleton shared across the whole test
+    session — /login is now rate-limited too, so any test file that logs in
+    more than once needs this, not just tests/test_rate_limiting.py.
+    """
+    from app.rate_limit import limiter
+
+    limiter.reset()
+    yield
+
+
 class _FakeResponse:
     """Mimics the object returned by client.responses.create()."""
     def __init__(self, text: str):

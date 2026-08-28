@@ -24,12 +24,8 @@ def _setup_db():
     yield
 
 
-@pytest.fixture(autouse=True)
-def _reset_rate_limits():
-    """Every test starts with a clean rate-limit counter, regardless of what
-    other tests (in this file or others) hit before it."""
-    limiter.reset()
-    yield
+# Rate-limit reset is now a global autouse fixture in tests/conftest.py,
+# since more than one test module logs in via the now-limited /login route.
 
 
 @pytest.fixture

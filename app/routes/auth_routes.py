@@ -4,10 +4,15 @@ embedded in a URL, logged, cached in browser history, or leaked via Referer.
 """
 
 import html
-from fastapi import APIRouter, Form, Query
+import logging
+
+from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.auth import key_matches, set_session_cookie, clear_session_cookie
+from app.rate_limit import limiter
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["auth"])
 
@@ -75,9 +80,16 @@ def login_form(next: str = Query(default="/dashboard/leads")):
 
 
 @router.post("/login", response_class=HTMLResponse)
-def login_submit(key: str = Form(...), next: str = Form(default="/dashboard/leads")):
+@limiter.limit("5/minute")
+def login_submit(
+    request: Request, key: str = Form(...), next: str = Form(default="/dashboard/leads")
+):
     safe_next = _safe_next(next)
     if not key_matches(key):
+        logger.warning(
+            "Failed dashboard login attempt from %s",
+            request.headers.get("X-Forwarded-For", request.client.host if request.client else "unknown"),
+        )
         return HTMLResponse(content=render_login(error="Incorrect key.", next_path=safe_next))
 
     response = RedirectResponse(url=safe_next, status_code=303)

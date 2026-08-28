@@ -77,3 +77,18 @@ class BusinessConfig(SQLModel, table=True):
     collect_notes: bool = True
     send_customer_sms: bool = True
     send_owner_sms: bool = True
+
+
+class AppSetting(SQLModel, table=True):
+    """Small key/value store for global app state that needs to persist
+    across restarts/redeploys but doesn't warrant its own table.
+
+    Currently used for the dashboard session-revocation counter (see
+    app/auth.py). Deliberately in the database rather than a local file:
+    Railway's app container filesystem is not guaranteed to persist across
+    redeploys, but the configured database (Postgres in production) is a
+    separate managed service and does.
+    """
+
+    key: str = Field(primary_key=True)
+    value: str
