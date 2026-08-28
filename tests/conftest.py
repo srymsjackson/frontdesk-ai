@@ -49,6 +49,23 @@ def _reset_rate_limits():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _reset_twilio_replay_cache():
+    """Same reasoning as _reset_rate_limits above: app.security's
+    _seen_requests dict is a module-level singleton shared across the whole
+    test session, and several test files send Twilio-signed requests with
+    identical params. Without a reset, a later test's "first" request could
+    be seen as a within-window repeat of an earlier test's request purely by
+    coincidence of using the same dummy params -- which happens to still
+    pass (repeats within the window are allowed), but would silently stop
+    testing what it claims to if this dict were never cleared, and would
+    grow unboundedly across a long test session."""
+    from app.security import _seen_requests
+
+    _seen_requests.clear()
+    yield
+
+
 class _FakeResponse:
     """Mimics the object returned by client.responses.create()."""
     def __init__(self, text: str):
