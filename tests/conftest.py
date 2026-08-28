@@ -28,6 +28,7 @@ os.environ.setdefault("TWILIO_AUTH_TOKEN", "test-auth-token-not-a-real-secret")
 os.environ.setdefault("TWILIO_ACCOUNT_SID", "ACtestaccountsidnotreal00000000")
 os.environ.setdefault("BASE_URL", "http://testserver")
 os.environ.setdefault("DATABASE_URL", "sqlite:///./test_twilio_auth.db")
+os.environ.setdefault("DASHBOARD_KEY", "test-dashboard-key-not-a-real-secret")
 
 import pytest
 

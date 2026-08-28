@@ -1,24 +1,17 @@
-"""Simple HTML dashboard for viewing leads. Protected by a shared secret query param."""
+"""Simple HTML dashboard for viewing leads. Protected by a signed session
+cookie set at /login — see app/auth.py."""
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends
 from fastapi.responses import HTMLResponse
 from sqlmodel import Session, select, func
 from datetime import datetime, timedelta
 from app.db import get_session
 from app.models import Lead, Business
 from app.config import settings
-import os
+from app.auth import require_dashboard_auth
 import html
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
-
-DASHBOARD_KEY = os.getenv("DASHBOARD_KEY", "")
-
-
-def check_key(key: str):
-    """Raise 401 if the provided key doesn't match the configured secret."""
-    if not DASHBOARD_KEY or key != DASHBOARD_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def esc(value):
@@ -30,12 +23,10 @@ def esc(value):
 
 @router.get("/leads", response_class=HTMLResponse)
 def leads_dashboard(
-    key: str = Query(default=""),
     session: Session = Depends(get_session),
+    _auth: None = Depends(require_dashboard_auth),
 ):
     """Render a plain HTML page with lead stats and a table of recent leads."""
-    check_key(key)
-
     now = datetime.utcnow()
     today_start = datetime(now.year, now.month, now.day)
     week_start = now - timedelta(days=7)

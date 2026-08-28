@@ -1,0 +1,507 @@
+diff --git a/app/auth.py b/app/auth.py
+new file mode 100644
+index 0000000..51f4ddc
+--- /dev/null
++++ b/app/auth.py
+@@ -0,0 +1,78 @@
++"""Dashboard/onboarding authentication.
++
++Replaces the old bare query-string `?key=...` scheme (which leaks into server
++logs, browser history, and Referer headers — see the DASHBOARD_KEY exposure
++that prompted this) with a login form that sets a signed, HttpOnly session
++cookie. The shared secret (DASHBOARD_KEY) is only ever typed into a POST body
++now, never carried in a URL.
++"""
++
++import os
++import secrets
++
++from fastapi import Request
++from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
++
++from app.config import settings
++
++DASHBOARD_KEY = os.getenv("DASHBOARD_KEY", "")
++
++SESSION_COOKIE_NAME = "dashboard_session"
++SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60  # 7 days
++
++# Signing secret for the session cookie. Derived from DASHBOARD_KEY (the only
++# secret this app currently has) with a distinct salt so a session token can
++# never be replayed as the raw key or vice versa.
++_serializer = URLSafeTimedSerializer(DASHBOARD_KEY or "dev-insecure-fallback-key", salt="dashboard-session")
++
++
++class NotAuthenticated(Exception):
++    """Raised by require_dashboard_auth; app.main registers a handler that
++    turns this into a 303 redirect to /login instead of a bare 401, since
++    these are browser-facing HTML pages, not an API."""
++
++
++def key_matches(candidate: str) -> bool:
++    """Constant-time comparison against the configured DASHBOARD_KEY."""
++    if not DASHBOARD_KEY:
++        return False
++    return secrets.compare_digest(candidate, DASHBOARD_KEY)
++
++
++def create_session_cookie_value() -> str:
++    """Return a signed, timestamped token to store in the session cookie."""
++    return _serializer.dumps({"authenticated": True})
++
++
++def verify_session_token(token: str) -> bool:
++    try:
++        data = _serializer.loads(token, max_age=SESSION_MAX_AGE_SECONDS)
++    except (BadSignature, SignatureExpired):
++        return False
++    return bool(data.get("authenticated"))
++
++
++def require_dashboard_auth(request: Request) -> None:
++    """FastAPI dependency: raises NotAuthenticated unless the request carries
++    a valid, unexpired session cookie."""
++    token = request.cookies.get(SESSION_COOKIE_NAME, "")
++    if not token or not verify_session_token(token):
++        raise NotAuthenticated()
++
++
++def set_session_cookie(response) -> None:
++    """Attach a fresh session cookie to an outgoing response after login."""
++    response.set_cookie(
++        key=SESSION_COOKIE_NAME,
++        value=create_session_cookie_value(),
++        max_age=SESSION_MAX_AGE_SECONDS,
++        httponly=True,
++        samesite="lax",
++        # Only require HTTPS transport in production — local/dev testing over
++        # plain http would otherwise silently drop the cookie.
++        secure=(settings.app_env == "production"),
++    )
++
++
++def clear_session_cookie(response) -> None:
++    response.delete_cookie(key=SESSION_COOKIE_NAME)
+diff --git a/app/main.py b/app/main.py
+index 3017563..0f023e9 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -5,8 +5,11 @@ when the app starts.
+ """
+ 
+ from fastapi import FastAPI
++from fastapi.responses import RedirectResponse
++from urllib.parse import quote
+ from app.config import settings
+ from app.db import create_db_and_tables
++from app.auth import NotAuthenticated
+ from app.routes.voice import router as voice_router
+ from app.routes.sms import router as sms_router
+ from app.routes.leads import router as leads_router
+@@ -15,10 +18,21 @@ from app.routes.dashboard import router as dashboard_router
+ from app.routes.demo import router as demo_router
+ from app.routes.onboarding import router as onboarding_router
+ from app.routes.billing import router as billing_router
++from app.routes.auth_routes import router as auth_router
+ 
+ app = FastAPI(title=settings.app_name)
+ 
+ 
++@app.exception_handler(NotAuthenticated)
++def not_authenticated_handler(request, exc):
++    """Dashboard/onboarding pages redirect to /login instead of a bare 401 —
++    these are browser-facing HTML pages, not an API."""
++    next_path = request.url.path
++    if request.url.query:
++        next_path = f"{next_path}?{request.url.query}"
++    return RedirectResponse(url=f"/login?next={quote(next_path, safe='')}", status_code=303)
++
++
+ @app.on_event("startup")
+ def on_startup() -> None:
+     # Create tables if they do not exist yet.
+@@ -38,4 +52,5 @@ app.include_router(calls_router)
+ app.include_router(dashboard_router)
+ app.include_router(demo_router)
+ app.include_router(onboarding_router)
+-app.include_router(billing_router)
+\ No newline at end of file
++app.include_router(billing_router)
++app.include_router(auth_router)
+\ No newline at end of file
+diff --git a/app/routes/auth_routes.py b/app/routes/auth_routes.py
+new file mode 100644
+index 0000000..3d49b5a
+--- /dev/null
++++ b/app/routes/auth_routes.py
+@@ -0,0 +1,92 @@
++"""Login form that exchanges the shared DASHBOARD_KEY for a signed session
++cookie, so the key is only ever submitted once via POST body — never
++embedded in a URL, logged, cached in browser history, or leaked via Referer.
++"""
++
++import html
++from fastapi import APIRouter, Form, Query
++from fastapi.responses import HTMLResponse, RedirectResponse
++
++from app.auth import key_matches, set_session_cookie, clear_session_cookie
++
++router = APIRouter(tags=["auth"])
++
++
++def esc(value):
++    if value is None:
++        return ""
++    return html.escape(str(value))
++
++
++def render_login(error: str | None = None, next_path: str = "/dashboard/leads") -> str:
++    error_html = f'<div class="banner error">{esc(error)}</div>' if error else ""
++    return f"""
++    <!DOCTYPE html>
++    <html>
++    <head>
++        <meta charset="utf-8">
++        <title>Sign in</title>
++        <style>
++            body {{ font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 80px 24px;
++                    display: flex; justify-content: center; color: #222; }}
++            .card {{ width: 100%; max-width: 360px; }}
++            h1 {{ font-size: 20px; margin-bottom: 20px; }}
++            label {{ display: block; font-size: 13px; font-weight: 600; color: #444; margin-bottom: 6px; }}
++            input[type=password] {{
++                width: 100%; padding: 10px 12px; font-size: 14px; border: 1px solid #ccc;
++                border-radius: 6px; box-sizing: border-box; font-family: inherit;
++            }}
++            button {{
++                margin-top: 16px; width: 100%; padding: 10px 20px; font-size: 14px; font-weight: 600;
++                background: #222; color: #fff; border: none; border-radius: 6px; cursor: pointer;
++            }}
++            button:hover {{ background: #444; }}
++            .banner {{ padding: 12px 16px; border-radius: 6px; margin-bottom: 20px; font-size: 14px; }}
++            .banner.error {{ background: #fdecea; color: #a33; }}
++        </style>
++    </head>
++    <body>
++        <div class="card">
++            <h1>Sign in</h1>
++            {error_html}
++            <form method="post" action="/login">
++                <input type="hidden" name="next" value="{esc(next_path)}">
++                <label for="key">Access key</label>
++                <input type="password" id="key" name="key" required autofocus>
++                <button type="submit">Sign in</button>
++            </form>
++        </div>
++    </body>
++    </html>
++    """
++
++
++def _safe_next(next_path: str) -> str:
++    """Only ever redirect to a same-site path, never an absolute/external URL,
++    so /login?next=... can't be used as an open redirect."""
++    if next_path.startswith("/") and not next_path.startswith("//"):
++        return next_path
++    return "/dashboard/leads"
++
++
++@router.get("/login", response_class=HTMLResponse)
++def login_form(next: str = Query(default="/dashboard/leads")):
++    return HTMLResponse(content=render_login(next_path=_safe_next(next)))
++
++
++@router.post("/login", response_class=HTMLResponse)
++def login_submit(key: str = Form(...), next: str = Form(default="/dashboard/leads")):
++    safe_next = _safe_next(next)
++    if not key_matches(key):
++        return HTMLResponse(content=render_login(error="Incorrect key.", next_path=safe_next))
++
++    response = RedirectResponse(url=safe_next, status_code=303)
++    set_session_cookie(response)
++    return response
++
++
++@router.get("/logout")
++def logout():
++    response = RedirectResponse(url="/login", status_code=303)
++    clear_session_cookie(response)
++    return response
+diff --git a/app/routes/dashboard.py b/app/routes/dashboard.py
+index 497e4f9..a9e7328 100644
+--- a/app/routes/dashboard.py
++++ b/app/routes/dashboard.py
+@@ -1,25 +1,18 @@
+-"""Simple HTML dashboard for viewing leads. Protected by a shared secret query param."""
++"""Simple HTML dashboard for viewing leads. Protected by a signed session
++cookie set at /login — see app/auth.py."""
+ 
+-from fastapi import APIRouter, Depends, HTTPException, Query
++from fastapi import APIRouter, Depends
+ from fastapi.responses import HTMLResponse
+ from sqlmodel import Session, select, func
+ from datetime import datetime, timedelta
+ from app.db import get_session
+ from app.models import Lead, Business
+ from app.config import settings
+-import os
++from app.auth import require_dashboard_auth
+ import html
+ 
+ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+ 
+-DASHBOARD_KEY = os.getenv("DASHBOARD_KEY", "")
+-
+-
+-def check_key(key: str):
+-    """Raise 401 if the provided key doesn't match the configured secret."""
+-    if not DASHBOARD_KEY or key != DASHBOARD_KEY:
+-        raise HTTPException(status_code=401, detail="Unauthorized")
+-
+ 
+ def esc(value):
+     """HTML-escape a value for safe inline rendering."""
+@@ -30,12 +23,10 @@ def esc(value):
+ 
+ @router.get("/leads", response_class=HTMLResponse)
+ def leads_dashboard(
+-    key: str = Query(default=""),
+     session: Session = Depends(get_session),
++    _auth: None = Depends(require_dashboard_auth),
+ ):
+     """Render a plain HTML page with lead stats and a table of recent leads."""
+-    check_key(key)
+-
+     now = datetime.utcnow()
+     today_start = datetime(now.year, now.month, now.day)
+     week_start = now - timedelta(days=7)
+diff --git a/app/routes/onboarding.py b/app/routes/onboarding.py
+index 90cde62..09e22fd 100644
+--- a/app/routes/onboarding.py
++++ b/app/routes/onboarding.py
+@@ -1,20 +1,21 @@
+ """Client intake form: turns a new business's answers into a Business + BusinessConfig row.
+ 
+-Protected by the same shared-secret key as the dashboard. This does NOT generate
+-prompts with AI — it's a structured place to type in prompt wording by hand so a new
+-business's config lives in one form instead of being hand-built in a Python shell.
++Protected by the same signed session-cookie auth as the dashboard (see app/auth.py).
++This does NOT generate prompts with AI — it's a structured place to type in prompt
++wording by hand so a new business's config lives in one form instead of being
++hand-built in a Python shell.
+ """
+ 
+ import html
+ import json
+ import logging
+-from fastapi import APIRouter, Depends, Form, HTTPException, Query
++from fastapi import APIRouter, Depends, Form
+ from fastapi.responses import HTMLResponse
+ from sqlmodel import Session, select
+ 
+ from app.db import get_session
+ from app.models import Business, BusinessConfig
+-from app.routes.dashboard import DASHBOARD_KEY, check_key
++from app.auth import require_dashboard_auth
+ from app.config import settings
+ 
+ logger = logging.getLogger(__name__)
+@@ -29,8 +30,8 @@ def esc(value):
+     return html.escape(str(value))
+ 
+ 
+-def render_form(key: str, error: str | None = None, success: str | None = None) -> str:
+-    """Render the intake form. `key` is threaded through so the POST stays authorized.
++def render_form(error: str | None = None, success: str | None = None) -> str:
++    """Render the intake form.
+ 
+     `success` is trusted HTML (built server-side, not from user input) so links render;
+     `error` is always escaped since it can echo back user-typed values."""
+@@ -74,7 +75,7 @@ def render_form(key: str, error: str | None = None, success: str | None = None)
+         {error_html}
+         {success_html}
+ 
+-        <form method="post" action="/onboarding/create?key={esc(key)}">
++        <form method="post" action="/onboarding/create">
+             <h2>Business basics</h2>
+ 
+             <label>Business name</label>
+@@ -169,15 +170,13 @@ def render_form(key: str, error: str | None = None, success: str | None = None)
+ 
+ 
+ @router.get("", response_class=HTMLResponse)
+-def intake_form(key: str = Query(default="")):
++def intake_form(_auth: None = Depends(require_dashboard_auth)):
+     """Render the blank intake form."""
+-    check_key(key)
+-    return HTMLResponse(content=render_form(key))
++    return HTMLResponse(content=render_form())
+ 
+ 
+ @router.post("/create", response_class=HTMLResponse)
+ def create_business(
+-    key: str = Query(default=""),
+     name: str = Form(...),
+     twilio_number: str = Form(...),
+     owner_phone: str = Form(...),
+@@ -199,17 +198,16 @@ def create_business(
+     send_customer_sms: bool = Form(False),
+     send_owner_sms: bool = Form(False),
+     session: Session = Depends(get_session),
++    _auth: None = Depends(require_dashboard_auth),
+ ):
+     """Create the Business + BusinessConfig rows from submitted form data."""
+-    check_key(key)
+-
+     name = name.strip()
+     twilio_number = twilio_number.strip()
+     owner_phone = owner_phone.strip()
+ 
+     if not name or not twilio_number or not owner_phone:
+         return HTMLResponse(
+-            content=render_form(key, error="Business name, Twilio number, and owner phone are required.")
++            content=render_form(error="Business name, Twilio number, and owner phone are required.")
+         )
+ 
+     existing = session.exec(
+@@ -217,7 +215,7 @@ def create_business(
+     ).first()
+     if existing:
+         return HTMLResponse(
+-            content=render_form(key, error=f"A business already uses Twilio number {twilio_number} (id={existing.id}).")
++            content=render_form(error=f"A business already uses Twilio number {twilio_number} (id={existing.id}).")
+         )
+ 
+     business = Business(
+@@ -271,4 +269,4 @@ def create_business(
+         f"Also point their Twilio number's voice webhook at your /voice/incoming endpoint."
+     )
+ 
+-    return HTMLResponse(content=render_form(key, success=success_html))
++    return HTMLResponse(content=render_form(success=success_html))
+diff --git a/requirements.txt b/requirements.txt
+index a63f44183a4efc5e8aeb035cf7f18cd53e67cd9c..b350948a6924f59faa7a7001c3372b9bdc758d64 100644
+GIT binary patch
+delta 50
+zcmcb|)5g2u43lamLkUAMLkdG8LmopqLn=cNLq0<(P{bApjTrR6*kJQXrm4&TN)ZdW
+
+delta 12
+TcmZqUy~nfR4AbT>Op}-aBbNm_
+
+diff --git a/tests/conftest.py b/tests/conftest.py
+index f070626..1c2b31e 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -28,6 +28,7 @@ os.environ.setdefault("TWILIO_AUTH_TOKEN", "test-auth-token-not-a-real-secret")
+ os.environ.setdefault("TWILIO_ACCOUNT_SID", "ACtestaccountsidnotreal00000000")
+ os.environ.setdefault("BASE_URL", "http://testserver")
+ os.environ.setdefault("DATABASE_URL", "sqlite:///./test_twilio_auth.db")
++os.environ.setdefault("DASHBOARD_KEY", "test-dashboard-key-not-a-real-secret")
+ 
+ import pytest
+ 
+diff --git a/tests/results.md b/tests/results.md
+index 94e223a..3d960b5 100644
+--- a/tests/results.md
++++ b/tests/results.md
+@@ -1,8 +1,8 @@
+ # Stress-test results
+ 
+-_Generated by the test suite on 2026-08-28 16:22 — re-run `pytest` to refresh._
++_Generated by the test suite on 2026-08-28 18:20 — re-run `pytest` to refresh._
+ 
+-**Overall: 49/49 scenarios passed.**
++**Overall: 56/56 scenarios passed.**
+ 
+ | Category | Passed | Total |
+ | --- | --- | --- |
+@@ -10,6 +10,6 @@ _Generated by the test suite on 2026-08-28 16:22 — re-run `pytest` to refresh.
+ | Ambiguous bookings | 14 | 14 |
+ | Hostile / off-script callers | 9 | 9 |
+ | Failure injection (OpenAI down / malformed) | 9 | 9 |
+-| Uncategorized | 5 | 5 |
++| Uncategorized | 12 | 12 |
+ 
+ All scenarios passed on the most recent run.
+diff --git a/tests/test_dashboard_auth.py b/tests/test_dashboard_auth.py
+new file mode 100644
+index 0000000..1c0a6bb
+--- /dev/null
++++ b/tests/test_dashboard_auth.py
+@@ -0,0 +1,76 @@
++"""Dashboard/onboarding auth tests (Priority 2B of the hardening plan).
++
++Confirms the key never has to appear in a URL: /dashboard/leads and
++/onboarding redirect unauthenticated visitors to /login, a POST with the
++correct key sets a session cookie, and that cookie is what grants access
++afterward — not any query string.
++"""
++
++import pytest
++from fastapi.testclient import TestClient
++
++from app.main import app
++from app.db import engine
++from sqlmodel import SQLModel
++
++
++@pytest.fixture(scope="module", autouse=True)
++def _setup_db():
++    SQLModel.metadata.create_all(engine)
++    yield
++
++
++@pytest.fixture
++def client():
++    # follow_redirects=False so we can assert on the redirect itself, not
++    # just where it eventually lands.
++    return TestClient(app, follow_redirects=False)
++
++
++def test_dashboard_redirects_to_login_when_unauthenticated(client):
++    resp = client.get("/dashboard/leads")
++    assert resp.status_code == 303
++    assert resp.headers["location"].startswith("/login")
++
++
++def test_onboarding_redirects_to_login_when_unauthenticated(client):
++    resp = client.get("/onboarding")
++    assert resp.status_code == 303
++    assert resp.headers["location"].startswith("/login")
++
++
++def test_login_with_wrong_key_does_not_set_cookie(client):
++    resp = client.post("/login", data={"key": "totally-wrong-key"})
++    assert resp.status_code == 200  # re-renders the form with an error
++    assert "dashboard_session" not in resp.cookies
++
++
++def test_login_with_correct_key_sets_cookie_and_redirects(client):
++    resp = client.post("/login", data={"key": "test-dashboard-key-not-a-real-secret"})
++    assert resp.status_code == 303
++    assert "dashboard_session" in resp.cookies
++
++
++def test_session_cookie_grants_dashboard_access(client):
++    login_resp = client.post("/login", data={"key": "test-dashboard-key-not-a-real-secret"})
++    session_cookie = login_resp.cookies["dashboard_session"]
++
++    resp = client.get("/dashboard/leads", cookies={"dashboard_session": session_cookie})
++    assert resp.status_code == 200
++    assert "Leads" in resp.text
++
++
++def test_garbage_cookie_value_is_rejected(client):
++    resp = client.get("/dashboard/leads", cookies={"dashboard_session": "not-a-valid-signed-token"})
++    assert resp.status_code == 303
++    assert resp.headers["location"].startswith("/login")
++
++
++def test_login_next_param_is_not_an_open_redirect(client):
++    """?next=https://evil.example must not be honored as a redirect target."""
++    resp = client.post(
++        "/login",
++        data={"key": "test-dashboard-key-not-a-real-secret", "next": "https://evil.example/phish"},
++    )
++    assert resp.status_code == 303
++    assert resp.headers["location"] == "/dashboard/leads"

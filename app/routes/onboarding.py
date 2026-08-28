@@ -1,20 +1,21 @@
 """Client intake form: turns a new business's answers into a Business + BusinessConfig row.
 
-Protected by the same shared-secret key as the dashboard. This does NOT generate
-prompts with AI — it's a structured place to type in prompt wording by hand so a new
-business's config lives in one form instead of being hand-built in a Python shell.
+Protected by the same signed session-cookie auth as the dashboard (see app/auth.py).
+This does NOT generate prompts with AI — it's a structured place to type in prompt
+wording by hand so a new business's config lives in one form instead of being
+hand-built in a Python shell.
 """
 
 import html
 import json
 import logging
-from fastapi import APIRouter, Depends, Form, HTTPException, Query
+from fastapi import APIRouter, Depends, Form
 from fastapi.responses import HTMLResponse
 from sqlmodel import Session, select
 
 from app.db import get_session
 from app.models import Business, BusinessConfig
-from app.routes.dashboard import DASHBOARD_KEY, check_key
+from app.auth import require_dashboard_auth
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -29,8 +30,8 @@ def esc(value):
     return html.escape(str(value))
 
 
-def render_form(key: str, error: str | None = None, success: str | None = None) -> str:
-    """Render the intake form. `key` is threaded through so the POST stays authorized.
+def render_form(error: str | None = None, success: str | None = None) -> str:
+    """Render the intake form.
 
     `success` is trusted HTML (built server-side, not from user input) so links render;
     `error` is always escaped since it can echo back user-typed values."""
@@ -74,7 +75,7 @@ def render_form(key: str, error: str | None = None, success: str | None = None) 
         {error_html}
         {success_html}
 
-        <form method="post" action="/onboarding/create?key={esc(key)}">
+        <form method="post" action="/onboarding/create">
             <h2>Business basics</h2>
 
             <label>Business name</label>
@@ -169,15 +170,13 @@ def render_form(key: str, error: str | None = None, success: str | None = None) 
 
 
 @router.get("", response_class=HTMLResponse)
-def intake_form(key: str = Query(default="")):
+def intake_form(_auth: None = Depends(require_dashboard_auth)):
     """Render the blank intake form."""
-    check_key(key)
-    return HTMLResponse(content=render_form(key))
+    return HTMLResponse(content=render_form())
 
 
 @router.post("/create", response_class=HTMLResponse)
 def create_business(
-    key: str = Query(default=""),
     name: str = Form(...),
     twilio_number: str = Form(...),
     owner_phone: str = Form(...),
@@ -199,17 +198,16 @@ def create_business(
     send_customer_sms: bool = Form(False),
     send_owner_sms: bool = Form(False),
     session: Session = Depends(get_session),
+    _auth: None = Depends(require_dashboard_auth),
 ):
     """Create the Business + BusinessConfig rows from submitted form data."""
-    check_key(key)
-
     name = name.strip()
     twilio_number = twilio_number.strip()
     owner_phone = owner_phone.strip()
 
     if not name or not twilio_number or not owner_phone:
         return HTMLResponse(
-            content=render_form(key, error="Business name, Twilio number, and owner phone are required.")
+            content=render_form(error="Business name, Twilio number, and owner phone are required.")
         )
 
     existing = session.exec(
@@ -217,7 +215,7 @@ def create_business(
     ).first()
     if existing:
         return HTMLResponse(
-            content=render_form(key, error=f"A business already uses Twilio number {twilio_number} (id={existing.id}).")
+            content=render_form(error=f"A business already uses Twilio number {twilio_number} (id={existing.id}).")
         )
 
     business = Business(
@@ -271,4 +269,4 @@ def create_business(
         f"Also point their Twilio number's voice webhook at your /voice/incoming endpoint."
     )
 
-    return HTMLResponse(content=render_form(key, success=success_html))
+    return HTMLResponse(content=render_form(success=success_html))
