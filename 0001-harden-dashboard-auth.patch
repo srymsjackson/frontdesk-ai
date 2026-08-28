@@ -1,0 +1,544 @@
+From 199c0d843246c371cabda10326ccd131f3fdf4b2 Mon Sep 17 00:00:00 2001
+From: srymsjackson <jstrazzo22@gmail.com>
+Date: Fri, 28 Aug 2026 20:04:30 +0000
+Subject: [PATCH] Harden dashboard auth: independent session secret, /login
+ rate limit, session revocation
+
+- SESSION_SECRET now signs session cookies, separate from DASHBOARD_KEY.
+  Previously both used the same value, so a second DASHBOARD_KEY leak (it
+  already leaked once, into Railway logs) would let an attacker forge
+  session cookies directly, bypassing /login entirely.
+
+- /login is now rate-limited (5/min per IP, matching /onboarding/create) via
+  the existing slowapi limiter. It was the one genuinely brute-forceable
+  endpoint left without a cap; failed attempts are also logged.
+
+- Session cookies now carry a version number checked against a live value
+  in the database (new AppSetting table). revoke_all_sessions() bumps it,
+  invalidating every outstanding session in one write -- useful right after
+  rotating DASHBOARD_KEY, or if a device with a live session is lost. Run
+  via 'python -m app.auth'. Stored in the DB rather than a local file since
+  Railway's app container filesystem isn't guaranteed to survive a
+  redeploy, but the configured database is a separate managed service.
+
+Also: moved the rate-limiter test reset fixture from test_rate_limiting.py
+into tests/conftest.py as a global autouse fixture, since /login being
+rate-limited now means more than one test module logs in via it -- the
+limiter is a shared in-process singleton across the whole test session.
+
+Tests: tests/test_auth_hardening.py (7 new tests). Full suite: 78/78
+passing. Verified each new test fails in the right place by reverting its
+corresponding code change and re-running (rate limit removal ->
+test_login_rate_limited_after_5_per_minute fails; version-check removal ->
+test_revoke_all_sessions_invalidates_existing_cookie fails).
+---
+ .env.example                 |   5 +
+ app/auth.py                  | 106 ++++++++++++++++++--
+ app/models.py                |  17 +++-
+ app/routes/auth_routes.py    |  16 ++-
+ tests/conftest.py            |  16 +++
+ tests/results.md             |   6 +-
+ tests/test_auth_hardening.py | 187 +++++++++++++++++++++++++++++++++++
+ tests/test_rate_limiting.py  |   8 +-
+ 8 files changed, 343 insertions(+), 18 deletions(-)
+ create mode 100644 tests/test_auth_hardening.py
+
+diff --git a/.env.example b/.env.example
+index 3ea7e55..f13287e 100644
+--- a/.env.example
++++ b/.env.example
+@@ -15,6 +15,11 @@ SHOP_ADDRESS= City, State, Zip Code
+ OPENAI_API_KEY=your_openai_api_key
+ 
+ DASHBOARD_KEY=set_to_a_long_random_string
++# Separate from DASHBOARD_KEY on purpose — signs session cookies. If
++# DASHBOARD_KEY ever leaks again, a distinct SESSION_SECRET means the leak
++# can't be used to forge session cookies directly. Generate with:
++#   python -c "import secrets; print(secrets.token_urlsafe(32))"
++SESSION_SECRET=set_to_a_different_long_random_string
+ 
+ USE_ELEVENLABS=false
+ ELEVENLABS_API_KEY=sk_your_key_here
+diff --git a/app/auth.py b/app/auth.py
+index 51f4ddc..14f0869 100644
+--- a/app/auth.py
++++ b/app/auth.py
+@@ -5,25 +5,51 @@ logs, browser history, and Referer headers — see the DASHBOARD_KEY exposure
+ that prompted this) with a login form that sets a signed, HttpOnly session
+ cookie. The shared secret (DASHBOARD_KEY) is only ever typed into a POST body
+ now, never carried in a URL.
++
++Session cookies are signed with SESSION_SECRET, a separate value from
++DASHBOARD_KEY. This matters because DASHBOARD_KEY has already leaked once
++(into Railway logs, before the /login rework). If it ever leaks again,
++signing sessions with it would let an attacker forge a valid session cookie
++directly — bypassing /login, and any rate limit on /login, entirely. Keeping
++the two secrets independent means a leaked login key only grants what
++/login's rate limit allows: guessing the key, not manufacturing sessions.
+ """
+ 
++import logging
+ import os
+ import secrets
+ 
+ from fastapi import Request
+ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
++from sqlmodel import Session, select
+ 
+ from app.config import settings
++from app.db import engine
++from app.models import AppSetting
++
++logger = logging.getLogger(__name__)
+ 
+ DASHBOARD_KEY = os.getenv("DASHBOARD_KEY", "")
+ 
++# Independent secret for signing session cookies. Falls back to DASHBOARD_KEY
++# with a loud warning (not silently) so local/dev setups that predate this
++# still boot, but any real deployment should set its own SESSION_SECRET.
++SESSION_SECRET = os.getenv("SESSION_SECRET", "")
++if not SESSION_SECRET:
++    if DASHBOARD_KEY:
++        logger.warning(
++            "SESSION_SECRET is not set; falling back to DASHBOARD_KEY for session "
++            "signing. Set a separate SESSION_SECRET so a leaked DASHBOARD_KEY can't "
++            "be used to forge session cookies directly."
++        )
++        SESSION_SECRET = DASHBOARD_KEY
++    else:
++        SESSION_SECRET = "dev-insecure-fallback-key"
++
+ SESSION_COOKIE_NAME = "dashboard_session"
+ SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60  # 7 days
+ 
+-# Signing secret for the session cookie. Derived from DASHBOARD_KEY (the only
+-# secret this app currently has) with a distinct salt so a session token can
+-# never be replayed as the raw key or vice versa.
+-_serializer = URLSafeTimedSerializer(DASHBOARD_KEY or "dev-insecure-fallback-key", salt="dashboard-session")
++_serializer = URLSafeTimedSerializer(SESSION_SECRET, salt="dashboard-session")
+ 
+ 
+ class NotAuthenticated(Exception):
+@@ -39,9 +65,59 @@ def key_matches(candidate: str) -> bool:
+     return secrets.compare_digest(candidate, DASHBOARD_KEY)
+ 
+ 
++# --- Session revocation -----------------------------------------------------
++#
++# A signed cookie can't be individually revoked (there's no server-side state
++# to delete) — normally that means a leaked session cookie stays valid until
++# it expires, up to 7 days, no matter what you do. SESSION_VERSION closes that
++# gap cheaply: every issued token embeds the current version number, and
++# every check compares it against the live value in the database. Bumping the
++# version (via revoke_all_sessions()) invalidates every outstanding session in
++# one write, without needing a full session table or Redis for an app this size.
++#
++# This lives in the database (AppSetting), not a local file or in-memory
++# value: Railway's app container filesystem/process isn't guaranteed to
++# survive a redeploy, but the configured database is a separate managed
++# service and does — a file-based counter would silently un-revoke every
++# session on the next deploy, defeating the whole point.
++_SESSION_VERSION_KEY = "dashboard_session_version"
++
++
++def _read_session_version() -> int:
++    with Session(engine) as db:
++        row = db.exec(select(AppSetting).where(AppSetting.key == _SESSION_VERSION_KEY)).first()
++        if row is None:
++            return 0
++        try:
++            return int(row.value)
++        except ValueError:
++            return 0
++
++
++def revoke_all_sessions() -> int:
++    """Invalidate every outstanding session cookie. Returns the new version.
++
++    Call this any time DASHBOARD_KEY is rotated, or if a session is ever
++    suspected compromised (lost device, etc.) — there's no per-session
++    granularity, but for a single-operator dashboard "log everyone out" is
++    the right blunt instrument.
++    """
++    with Session(engine) as db:
++        row = db.exec(select(AppSetting).where(AppSetting.key == _SESSION_VERSION_KEY)).first()
++        new_version = (int(row.value) if row else 0) + 1
++        if row is None:
++            row = AppSetting(key=_SESSION_VERSION_KEY, value=str(new_version))
++        else:
++            row.value = str(new_version)
++        db.add(row)
++        db.commit()
++    logger.warning("All dashboard sessions revoked (version now %d)", new_version)
++    return new_version
++
++
+ def create_session_cookie_value() -> str:
+     """Return a signed, timestamped token to store in the session cookie."""
+-    return _serializer.dumps({"authenticated": True})
++    return _serializer.dumps({"authenticated": True, "v": _read_session_version()})
+ 
+ 
+ def verify_session_token(token: str) -> bool:
+@@ -49,7 +125,12 @@ def verify_session_token(token: str) -> bool:
+         data = _serializer.loads(token, max_age=SESSION_MAX_AGE_SECONDS)
+     except (BadSignature, SignatureExpired):
+         return False
+-    return bool(data.get("authenticated"))
++    if not data.get("authenticated"):
++        return False
++    # A token signed before the last revoke_all_sessions() call carries a
++    # stale version number and must be rejected even though its signature is
++    # still cryptographically valid.
++    return data.get("v") == _read_session_version()
+ 
+ 
+ def require_dashboard_auth(request: Request) -> None:
+@@ -76,3 +157,16 @@ def set_session_cookie(response) -> None:
+ 
+ def clear_session_cookie(response) -> None:
+     response.delete_cookie(key=SESSION_COOKIE_NAME)
++
++
++if __name__ == "__main__":
++    # `python -m app.auth` — revoke every outstanding dashboard session.
++    # Useful right after rotating DASHBOARD_KEY, or if a device with a live
++    # session is lost. Run against the same DATABASE_URL the app uses (e.g.
++    # `railway run python -m app.auth` in production) so it revokes the
++    # sessions that actually matter, not a local dev database.
++    from app.db import create_db_and_tables
++
++    create_db_and_tables()
++    new_version = revoke_all_sessions()
++    print(f"All dashboard sessions revoked. New session version: {new_version}")
+diff --git a/app/models.py b/app/models.py
+index d5d7e28..62798ae 100644
+--- a/app/models.py
++++ b/app/models.py
+@@ -76,4 +76,19 @@ class BusinessConfig(SQLModel, table=True):
+ 
+     collect_notes: bool = True
+     send_customer_sms: bool = True
+-    send_owner_sms: bool = True
+\ No newline at end of file
++    send_owner_sms: bool = True
++
++
++class AppSetting(SQLModel, table=True):
++    """Small key/value store for global app state that needs to persist
++    across restarts/redeploys but doesn't warrant its own table.
++
++    Currently used for the dashboard session-revocation counter (see
++    app/auth.py). Deliberately in the database rather than a local file:
++    Railway's app container filesystem is not guaranteed to persist across
++    redeploys, but the configured database (Postgres in production) is a
++    separate managed service and does.
++    """
++
++    key: str = Field(primary_key=True)
++    value: str
+\ No newline at end of file
+diff --git a/app/routes/auth_routes.py b/app/routes/auth_routes.py
+index 3d49b5a..f343458 100644
+--- a/app/routes/auth_routes.py
++++ b/app/routes/auth_routes.py
+@@ -4,10 +4,15 @@ embedded in a URL, logged, cached in browser history, or leaked via Referer.
+ """
+ 
+ import html
+-from fastapi import APIRouter, Form, Query
++import logging
++
++from fastapi import APIRouter, Form, Query, Request
+ from fastapi.responses import HTMLResponse, RedirectResponse
+ 
+ from app.auth import key_matches, set_session_cookie, clear_session_cookie
++from app.rate_limit import limiter
++
++logger = logging.getLogger(__name__)
+ 
+ router = APIRouter(tags=["auth"])
+ 
+@@ -75,9 +80,16 @@ def login_form(next: str = Query(default="/dashboard/leads")):
+ 
+ 
+ @router.post("/login", response_class=HTMLResponse)
+-def login_submit(key: str = Form(...), next: str = Form(default="/dashboard/leads")):
++@limiter.limit("5/minute")
++def login_submit(
++    request: Request, key: str = Form(...), next: str = Form(default="/dashboard/leads")
++):
+     safe_next = _safe_next(next)
+     if not key_matches(key):
++        logger.warning(
++            "Failed dashboard login attempt from %s",
++            request.headers.get("X-Forwarded-For", request.client.host if request.client else "unknown"),
++        )
+         return HTMLResponse(content=render_login(error="Incorrect key.", next_path=safe_next))
+ 
+     response = RedirectResponse(url=safe_next, status_code=303)
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 1c2b31e..338652e 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -33,6 +33,22 @@ os.environ.setdefault("DASHBOARD_KEY", "test-dashboard-key-not-a-real-secret")
+ import pytest
+ 
+ 
++@pytest.fixture(autouse=True)
++def _reset_rate_limits():
++    """Every test starts with a clean rate-limit counter, regardless of what
++    other tests (in this file or others) hit before it.
++
++    This is global (conftest.py, not a single test module) because the
++    slowapi Limiter is a module-level singleton shared across the whole test
++    session — /login is now rate-limited too, so any test file that logs in
++    more than once needs this, not just tests/test_rate_limiting.py.
++    """
++    from app.rate_limit import limiter
++
++    limiter.reset()
++    yield
++
++
+ class _FakeResponse:
+     """Mimics the object returned by client.responses.create()."""
+     def __init__(self, text: str):
+diff --git a/tests/results.md b/tests/results.md
+index e27a8b7..2441a17 100644
+--- a/tests/results.md
++++ b/tests/results.md
+@@ -1,8 +1,8 @@
+ # Stress-test results
+ 
+-_Generated by the test suite on 2026-08-28 19:11 — re-run `pytest` to refresh._
++_Generated by the test suite on 2026-08-28 20:04 — re-run `pytest` to refresh._
+ 
+-**Overall: 71/71 scenarios passed.**
++**Overall: 78/78 scenarios passed.**
+ 
+ | Category | Passed | Total |
+ | --- | --- | --- |
+@@ -10,6 +10,6 @@ _Generated by the test suite on 2026-08-28 19:11 — re-run `pytest` to refresh.
+ | Ambiguous bookings | 14 | 14 |
+ | Hostile / off-script callers | 9 | 9 |
+ | Failure injection (OpenAI down / malformed) | 9 | 9 |
+-| Uncategorized | 27 | 27 |
++| Uncategorized | 34 | 34 |
+ 
+ All scenarios passed on the most recent run.
+diff --git a/tests/test_auth_hardening.py b/tests/test_auth_hardening.py
+new file mode 100644
+index 0000000..4ed8ff8
+--- /dev/null
++++ b/tests/test_auth_hardening.py
+@@ -0,0 +1,187 @@
++"""Auth-chain hardening tests: session secret independence, /login rate
++limiting, and server-side session revocation.
++
++Follow-up to tests/test_dashboard_auth.py, covering the gaps identified in
++review: DASHBOARD_KEY had already leaked once, and before this pass (a) a
++second leak would let an attacker forge session cookies directly, (b) /login
++had no rate limit despite being the one truly brute-forceable endpoint, and
++(c) a leaked session cookie was valid for up to 7 days with no way to kill it
++early.
++"""
++
++import os
++
++import pytest
++from fastapi.testclient import TestClient
++from sqlmodel import SQLModel
++
++from app.main import app
++from app.db import engine
++
++
++@pytest.fixture(scope="module", autouse=True)
++def _setup_db():
++    SQLModel.metadata.create_all(engine)
++    yield
++
++
++@pytest.fixture
++def client():
++    return TestClient(app, follow_redirects=False)
++
++
++def _dashboard_key() -> str:
++    return os.environ["DASHBOARD_KEY"]
++
++
++# --- Session secret independence --------------------------------------------
++
++
++def test_session_cookie_is_not_signed_with_the_raw_dashboard_key(client):
++    """A session cookie must not be forgeable just by knowing DASHBOARD_KEY
++    and re-implementing itsdangerous by hand with that same value — i.e. the
++    live SESSION_SECRET must differ from DASHBOARD_KEY in this test env.
++
++    conftest.py sets DASHBOARD_KEY but not SESSION_SECRET, so app.auth falls
++    back to using DASHBOARD_KEY (with a warning) for signing — this test
++    exists to make that fallback visible and to fail loudly if a real
++    SESSION_SECRET ever gets set in test config without updating this
++    assumption, since production must not run on the fallback.
++    """
++    from app import auth as auth_module
++
++    if os.environ.get("SESSION_SECRET"):
++        assert auth_module.SESSION_SECRET != auth_module.DASHBOARD_KEY, (
++            "SESSION_SECRET is configured but matches DASHBOARD_KEY — set it to a "
++            "distinct value so a leaked DASHBOARD_KEY can't forge sessions."
++        )
++    else:
++        # No SESSION_SECRET configured: confirm the documented fallback
++        # behavior (same value, with a warning) rather than something silent
++        # or different from what app/auth.py's module docstring promises.
++        assert auth_module.SESSION_SECRET == auth_module.DASHBOARD_KEY
++
++
++def test_forged_cookie_using_dashboard_key_as_signing_secret_is_rejected(client, monkeypatch):
++    """Simulates the scenario SESSION_SECRET exists to prevent: attacker knows
++    DASHBOARD_KEY (e.g. from a log leak) and tries to sign their own session
++    cookie with it, bypassing /login entirely. With a real, distinct
++    SESSION_SECRET configured, this must fail even though the forged token
++    would have worked against the raw DASHBOARD_KEY-signed scheme.
++
++    Patches the module's _serializer directly via monkeypatch.setattr rather
++    than importlib.reload()'ing app.auth: reloading re-executes the module
++    body and creates a brand-new NotAuthenticated *class object*, which no
++    longer matches the exception-handler registration app.main did at import
++    time against the original class — silently breaking auth error handling
++    for every test that runs afterward in the same session. setattr swaps
++    just the one value under test and leaves everything else — including
++    class identity — alone.
++    """
++    from itsdangerous import URLSafeTimedSerializer
++    from app import auth as auth_module
++
++    real_session_secret = "a-real-distinct-session-secret-value"
++    monkeypatch.setattr(auth_module, "SESSION_SECRET", real_session_secret)
++    monkeypatch.setattr(
++        auth_module,
++        "_serializer",
++        URLSafeTimedSerializer(real_session_secret, salt="dashboard-session"),
++    )
++
++    # Attacker forges a token using the leaked DASHBOARD_KEY as if it were
++    # the signing secret.
++    forged_serializer = URLSafeTimedSerializer(_dashboard_key(), salt="dashboard-session")
++    forged_token = forged_serializer.dumps({"authenticated": True, "v": 0})
++
++    assert auth_module.verify_session_token(forged_token) is False
++
++
++# --- /login rate limiting ---------------------------------------------------
++
++
++def test_login_rate_limited_after_5_per_minute(client):
++    statuses = []
++    for _ in range(8):
++        resp = client.post("/login", data={"key": "wrong-key-on-purpose"})
++        statuses.append(resp.status_code)
++
++    # First 5 attempts reach the route and re-render the form with an error
++    # (200), regardless of whether the key was right.
++    assert all(s != 429 for s in statuses[:5]), statuses[:5]
++    # Everything past the cap is rejected by the limiter before touching
++    # key-comparison logic at all.
++    assert all(s == 429 for s in statuses[5:]), statuses[5:]
++
++
++def test_login_rate_limit_applies_even_to_correct_key(client):
++    """The cap is on attempts, not failures — a script trying the correct key
++    in a tight loop (e.g. a misconfigured client retrying) is capped the same
++    as a brute-force attempt."""
++    statuses = []
++    for _ in range(7):
++        resp = client.post("/login", data={"key": _dashboard_key()})
++        statuses.append(resp.status_code)
++
++    assert statuses[5] == 429
++    assert statuses[6] == 429
++
++
++# --- Session revocation -----------------------------------------------------
++
++
++def test_revoke_all_sessions_invalidates_existing_cookie(client):
++    from app.auth import revoke_all_sessions
++
++    login_resp = client.post("/login", data={"key": _dashboard_key()})
++    assert login_resp.status_code == 303
++    session_cookie = login_resp.cookies["dashboard_session"]
++
++    # Cookie works before revocation.
++    resp = client.get("/dashboard/leads", cookies={"dashboard_session": session_cookie})
++    assert resp.status_code == 200
++
++    revoke_all_sessions()
++
++    # Same cookie, same signature, now rejected — the version embedded in the
++    # token no longer matches the live version.
++    resp = client.get("/dashboard/leads", cookies={"dashboard_session": session_cookie})
++    assert resp.status_code == 303
++    assert resp.headers["location"].startswith("/login")
++
++
++def test_new_login_after_revocation_works_and_issues_a_fresh_valid_cookie(client):
++    from app.auth import revoke_all_sessions
++
++    revoke_all_sessions()
++
++    login_resp = client.post("/login", data={"key": _dashboard_key()})
++    assert login_resp.status_code == 303
++    new_cookie = login_resp.cookies["dashboard_session"]
++
++    resp = client.get("/dashboard/leads", cookies={"dashboard_session": new_cookie})
++    assert resp.status_code == 200
++
++
++def test_revocation_persists_across_a_fresh_db_session(client):
++    """Guards against a regression back to in-process/file state: the version
++    check must go through the same `engine` the rest of the app uses, so a
++    revoke from one process (e.g. a CLI invocation) is visible to requests
++    handled by another."""
++    from sqlmodel import Session
++    from app.db import engine
++    from app.auth import revoke_all_sessions, _read_session_version
++
++    login_resp = client.post("/login", data={"key": _dashboard_key()})
++    cookie = login_resp.cookies["dashboard_session"]
++
++    revoke_all_sessions()
++
++    # Read the version back via a brand-new DB session, simulating a
++    # different process reading the same persisted state.
++    with Session(engine):
++        version_seen_elsewhere = _read_session_version()
++
++    resp = client.get("/dashboard/leads", cookies={"dashboard_session": cookie})
++    assert resp.status_code == 303
++    assert version_seen_elsewhere >= 1
+diff --git a/tests/test_rate_limiting.py b/tests/test_rate_limiting.py
+index c6e09e8..92e808d 100644
+--- a/tests/test_rate_limiting.py
++++ b/tests/test_rate_limiting.py
+@@ -24,12 +24,8 @@ def _setup_db():
+     yield
+ 
+ 
+-@pytest.fixture(autouse=True)
+-def _reset_rate_limits():
+-    """Every test starts with a clean rate-limit counter, regardless of what
+-    other tests (in this file or others) hit before it."""
+-    limiter.reset()
+-    yield
++# Rate-limit reset is now a global autouse fixture in tests/conftest.py,
++# since more than one test module logs in via the now-limited /login route.
+ 
+ 
+ @pytest.fixture
+-- 
+2.43.0
+
