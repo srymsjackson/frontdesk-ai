@@ -1,0 +1,263 @@
+diff --git a/app/routes/demo.py b/app/routes/demo.py
+index dc09246..72c761f 100644
+--- a/app/routes/demo.py
++++ b/app/routes/demo.py
+@@ -22,10 +22,11 @@ import logging
+ import os
+ from datetime import datetime, timezone
+ 
+-from fastapi import APIRouter, Request, Response, WebSocket, WebSocketDisconnect
++from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketDisconnect
+ from fastapi.responses import HTMLResponse
+ 
+ from ..websocket_manager import manager  # adjust import path to match your structure
++from ..security import verify_twilio_signature
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -64,7 +65,7 @@ async def leads_ws(websocket: WebSocket) -> None:
+ 
+ # ── Twilio status callback ────────────────────────────────────────────────────
+ 
+-@router.post("/voice/status")
++@router.post("/voice/status", dependencies=[Depends(verify_twilio_signature)])
+ async def voice_status(request: Request) -> Response:
+     """
+     Twilio posts here when call status changes. We use it to broadcast
+diff --git a/app/routes/voice.py b/app/routes/voice.py
+index baf36e9..df00eb1 100644
+--- a/app/routes/voice.py
++++ b/app/routes/voice.py
+@@ -19,6 +19,7 @@ from twilio.twiml.voice_response import VoiceResponse, Gather
+ from fastapi.responses import Response as FastAPIResponse
+ from app.services.voice_service import generate_audio, get_audio
+ from app.services.twilio_service import send_sms
++from app.security import verify_twilio_signature
+ import asyncio
+ from datetime import datetime, timezone
+ from ..websocket_manager import manager
+@@ -94,7 +95,7 @@ def empty_state():
+     }
+ 
+ 
+-@router.post("/incoming")
++@router.post("/incoming", dependencies=[Depends(verify_twilio_signature)])
+ async def incoming_call(
+     session: Session = Depends(get_session),
+     From: str = Form(default=""),
+@@ -150,7 +151,7 @@ async def incoming_call(
+     )
+ 
+ 
+-@router.post("/collect")
++@router.post("/collect", dependencies=[Depends(verify_twilio_signature)])
+ async def collect_turn(
+     session: Session = Depends(get_session),
+     From: str = Form(default=""),
+diff --git a/app/security.py b/app/security.py
+new file mode 100644
+index 0000000..9fa669c
+--- /dev/null
++++ b/app/security.py
+@@ -0,0 +1,51 @@
++"""Request-authentication dependencies shared across routers.
++
++Currently: Twilio webhook signature verification. Twilio signs every request
++it sends to a configured webhook URL with an X-Twilio-Signature header, an
++HMAC-SHA1 over (exact URL Twilio POSTed to + sorted POST params) keyed by the
++account's auth token. Verifying it is the only way to know a request to
++/voice/* actually came from Twilio and not a scripted POST from anyone who
++found the URL.
++"""
++
++import logging
++from fastapi import Request, HTTPException
++from twilio.request_validator import RequestValidator
++from app.config import settings
++
++logger = logging.getLogger(__name__)
++
++
++async def verify_twilio_signature(request: Request) -> None:
++    """FastAPI dependency: 403s any request without a valid Twilio signature.
++
++    The signature covers the *exact* URL Twilio requested, so we rebuild it
++    from settings.base_url (the trusted, configured value) rather than
++    trusting request.url or the Host header — an attacker-controlled Host
++    header must never influence what URL we validate against.
++    """
++    if not settings.twilio_auth_token:
++        # An empty auth token means the HMAC key is a known, non-secret value —
++        # any caller could compute a "valid" signature themselves. Fail closed
++        # instead of silently accepting everything.
++        logger.error("TWILIO_AUTH_TOKEN is not configured; rejecting request to %s", request.url.path)
++        raise HTTPException(status_code=500, detail="Server misconfiguration")
++
++    signature = request.headers.get("X-Twilio-Signature", "")
++
++    form = await request.form()
++    params = dict(form)
++
++    url = f"{settings.base_url.rstrip('/')}{request.url.path}"
++    if request.url.query:
++        url = f"{url}?{request.url.query}"
++
++    validator = RequestValidator(settings.twilio_auth_token)
++
++    if not signature or not validator.validate(url, params, signature):
++        logger.warning(
++            "Rejected unsigned/invalid Twilio request path=%s has_sig=%s",
++            request.url.path,
++            bool(signature),
++        )
++        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 83cdbc2..f070626 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -20,6 +20,15 @@ import datetime as _dt
+ # call happens at construction; real calls are monkeypatched in the tests.
+ os.environ.setdefault("OPENAI_API_KEY", "sk-test-dummy")
+ 
++# Dummy Twilio + app settings so app.config.settings (a module-level singleton
++# built at first import) is fully populated before any test file imports
++# anything from app.*. Must live here, not in an individual test file, since
++# conftest.py is guaranteed to load first for the whole session.
++os.environ.setdefault("TWILIO_AUTH_TOKEN", "test-auth-token-not-a-real-secret")
++os.environ.setdefault("TWILIO_ACCOUNT_SID", "ACtestaccountsidnotreal00000000")
++os.environ.setdefault("BASE_URL", "http://testserver")
++os.environ.setdefault("DATABASE_URL", "sqlite:///./test_twilio_auth.db")
++
+ import pytest
+ 
+ 
+diff --git a/tests/results.md b/tests/results.md
+index 83844e5..94e223a 100644
+--- a/tests/results.md
++++ b/tests/results.md
+@@ -1,8 +1,8 @@
+ # Stress-test results
+ 
+-_Generated by the test suite on 2026-08-27 11:38 � re-run `pytest` to refresh._
++_Generated by the test suite on 2026-08-28 16:22 — re-run `pytest` to refresh._
+ 
+-**Overall: 44/44 scenarios passed.**
++**Overall: 49/49 scenarios passed.**
+ 
+ | Category | Passed | Total |
+ | --- | --- | --- |
+@@ -10,5 +10,6 @@ _Generated by the test suite on 2026-08-27 11:38 
+ | Ambiguous bookings | 14 | 14 |
+ | Hostile / off-script callers | 9 | 9 |
+ | Failure injection (OpenAI down / malformed) | 9 | 9 |
++| Uncategorized | 5 | 5 |
+ 
+ All scenarios passed on the most recent run.
+diff --git a/tests/test_twilio_auth.py b/tests/test_twilio_auth.py
+new file mode 100644
+index 0000000..24e12d5
+--- /dev/null
++++ b/tests/test_twilio_auth.py
+@@ -0,0 +1,102 @@
++"""Twilio webhook signature verification tests (Priority 2A of the hardening plan).
++
++Uses a real FastAPI TestClient against the actual app + dependency (not a
++mocked stand-in) so the test exercises the real HMAC check. No dependency
++override / test-mode bypass exists in application code at all — the only
++way these tests get a passing signature is by computing one correctly with
++twilio.request_validator.RequestValidator, the same way Twilio itself does.
++That keeps the bypass entirely in test code, never shippable to prod.
++"""
++
++import os
++
++# NOTE: the required env vars (TWILIO_AUTH_TOKEN, BASE_URL, DATABASE_URL, ...)
++# are set in tests/conftest.py, which loads before any test module — including
++# this one — so app.config.settings (a module-level singleton) is already
++# correctly populated by the time anything here imports app.*.
++
++import pytest
++from fastapi.testclient import TestClient
++from twilio.request_validator import RequestValidator
++
++from app.main import app
++from app.config import settings
++from app.db import engine
++from sqlmodel import SQLModel
++
++
++@pytest.fixture(scope="module", autouse=True)
++def _setup_db():
++    SQLModel.metadata.create_all(engine)
++    yield
++    # Clean up the on-disk test DB file so repeated runs start fresh.
++    db_path = settings.database_url.replace("sqlite:///", "")
++    if os.path.exists(db_path):
++        os.remove(db_path)
++
++
++@pytest.fixture
++def client():
++    return TestClient(app)
++
++
++def _sign(url: str, params: dict) -> str:
++    validator = RequestValidator(settings.twilio_auth_token)
++    return validator.compute_signature(url, params)
++
++
++def test_incoming_call_rejected_without_signature(client):
++    """No X-Twilio-Signature header at all -> 403, not processed."""
++    resp = client.post(
++        "/voice/incoming",
++        data={"From": "+15550001111", "To": "+15559998888", "CallSid": "CA123"},
++    )
++    assert resp.status_code == 403
++
++
++def test_incoming_call_rejected_with_wrong_signature(client):
++    """A signature that doesn't match the params -> 403."""
++    resp = client.post(
++        "/voice/incoming",
++        data={"From": "+15550001111", "To": "+15559998888", "CallSid": "CA123"},
++        headers={"X-Twilio-Signature": "not-a-real-signature=="},
++    )
++    assert resp.status_code == 403
++
++
++def test_incoming_call_accepted_with_valid_signature(client):
++    """A correctly computed signature for the exact URL+params -> passes auth
++    (falls through to the route's own 'business not configured' logic, which
++    is a 200 TwiML response since no Business row matches in the test DB —
++    the point here is it's NOT rejected at the auth layer)."""
++    params = {"From": "+15550001111", "To": "+15559998888", "CallSid": "CA123"}
++    url = f"{settings.base_url}/voice/incoming"
++    signature = _sign(url, params)
++
++    resp = client.post(
++        "/voice/incoming",
++        data=params,
++        headers={"X-Twilio-Signature": signature},
++    )
++    assert resp.status_code == 200
++    assert "not configured" in resp.text
++
++
++def test_voice_status_rejected_without_signature(client):
++    resp = client.post("/voice/status", data={"CallStatus": "completed", "CallSid": "CA999"})
++    assert resp.status_code == 403
++
++
++def test_voice_status_accepted_with_valid_signature(client):
++    """204 No Content is this route's normal success response — the point
++    is a valid signature reaches the handler at all instead of getting 403'd."""
++    params = {"CallStatus": "completed", "CallSid": "CA999"}
++    url = f"{settings.base_url}/voice/status"
++    signature = _sign(url, params)
++
++    resp = client.post(
++        "/voice/status",
++        data=params,
++        headers={"X-Twilio-Signature": signature},
++    )
++    assert resp.status_code == 204

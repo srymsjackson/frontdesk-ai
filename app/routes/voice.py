@@ -19,6 +19,7 @@ from twilio.twiml.voice_response import VoiceResponse, Gather
 from fastapi.responses import Response as FastAPIResponse
 from app.services.voice_service import generate_audio, get_audio
 from app.services.twilio_service import send_sms
+from app.security import verify_twilio_signature
 import asyncio
 from datetime import datetime, timezone
 from ..websocket_manager import manager
@@ -94,7 +95,7 @@ def empty_state():
     }
 
 
-@router.post("/incoming")
+@router.post("/incoming", dependencies=[Depends(verify_twilio_signature)])
 async def incoming_call(
     session: Session = Depends(get_session),
     From: str = Form(default=""),
@@ -150,7 +151,7 @@ async def incoming_call(
     )
 
 
-@router.post("/collect")
+@router.post("/collect", dependencies=[Depends(verify_twilio_signature)])
 async def collect_turn(
     session: Session = Depends(get_session),
     From: str = Form(default=""),

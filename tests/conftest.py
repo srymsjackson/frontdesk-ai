@@ -20,6 +20,15 @@ import datetime as _dt
 # call happens at construction; real calls are monkeypatched in the tests.
 os.environ.setdefault("OPENAI_API_KEY", "sk-test-dummy")
 
+# Dummy Twilio + app settings so app.config.settings (a module-level singleton
+# built at first import) is fully populated before any test file imports
+# anything from app.*. Must live here, not in an individual test file, since
+# conftest.py is guaranteed to load first for the whole session.
+os.environ.setdefault("TWILIO_AUTH_TOKEN", "test-auth-token-not-a-real-secret")
+os.environ.setdefault("TWILIO_ACCOUNT_SID", "ACtestaccountsidnotreal00000000")
+os.environ.setdefault("BASE_URL", "http://testserver")
+os.environ.setdefault("DATABASE_URL", "sqlite:///./test_twilio_auth.db")
+
 import pytest
 
 

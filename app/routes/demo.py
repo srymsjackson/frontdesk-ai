@@ -22,10 +22,11 @@ import logging
 import os
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 from ..websocket_manager import manager  # adjust import path to match your structure
+from ..security import verify_twilio_signature
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ async def leads_ws(websocket: WebSocket) -> None:
 
 # ── Twilio status callback ────────────────────────────────────────────────────
 
-@router.post("/voice/status")
+@router.post("/voice/status", dependencies=[Depends(verify_twilio_signature)])
 async def voice_status(request: Request) -> Response:
     """
     Twilio posts here when call status changes. We use it to broadcast
