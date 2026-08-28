@@ -1,0 +1,504 @@
+From 93611ad2888b2514adb3db1970bc8be12b098ce1 Mon Sep 17 00:00:00 2001
+From: srymsjackson <jstrazzo22@gmail.com>
+Date: Fri, 28 Aug 2026 21:28:41 +0000
+Subject: [PATCH] Sign /billing/checkout links instead of trusting raw
+ business_id/plan params
+
+/billing/checkout previously took business_id and plan as plain, editable
+query params: /billing/checkout?business_id=5&plan=basic. Rate limiting
+(already in place) slowed down brute-force enumeration, but did nothing
+about the more direct problem -- anyone holding a legitimate link could
+just edit it: change ?plan=basic to ?plan=pro, or change ?business_id=5 to
+?business_id=6 and have a completed payment activate a different business
+than the one the payer intended to pay for.
+
+New app/billing_tokens.py signs business_id + plan together into one opaque
+token (itsdangerous, same approach as SESSION_SECRET) with a 30-day
+expiry -- long enough that a link sitting in an unread SMS still works, not
+so long that a months-old link from an abandoned onboarding still does.
+CHECKOUT_LINK_SECRET is its own secret, falling back through SESSION_SECRET
+then DASHBOARD_KEY with a warning at each level, same layered pattern as
+app/auth.py -- keeps checkout-link forgery and session forgery as separate
+blast radii.
+
+/billing/checkout now takes ?token=... instead of business_id/plan; those
+two are no longer read from the query string at all, so there's nothing
+left to hand-edit. An invalid signature, a tampered token, an expired
+token, and a valid token pointing at a deleted business_id all now return
+the identical 400 -- no distinguishing signal about which failure mode
+happened. /onboarding/create generates token-based links.
+
+Also updated the existing /billing/checkout rate-limit test
+(tests/test_rate_limiting.py), which was still hitting the old
+?business_id=1&plan=basic URL -- it happened to still pass (it only checked
+the 429 boundary, never the response body), but was testing a URL shape the
+app no longer accepts. Rewrote it to mint a real token against a real
+Business row.
+
+Tests: tests/test_billing_checkout_tokens.py (10 new tests) -- token
+round-trip, tampering (bit-flip breaks the signature), confirms the route
+never reads business_id/plan from the query string even when both are
+supplied alongside a valid token, identical error response for
+invalid-signature vs valid-token-deleted-business, and onboarding actually
+emits ?token= links now. Full suite: 100/100 passing. Verified
+test_route_only_ever_uses_business_id_and_plan_from_the_verified_token
+catches a regression by reintroducing a trusted business_id override
+param and re-running (fails as expected).
+---
+ .env.example                          |   4 +
+ app/billing_tokens.py                 |  88 ++++++++++++
+ app/routes/billing.py                 |  24 +++-
+ app/routes/onboarding.py              |   7 +-
+ tests/results.md                      |  14 +-
+ tests/test_billing_checkout_tokens.py | 193 ++++++++++++++++++++++++++
+ tests/test_rate_limiting.py           |  15 +-
+ 7 files changed, 332 insertions(+), 13 deletions(-)
+ create mode 100644 app/billing_tokens.py
+ create mode 100644 tests/test_billing_checkout_tokens.py
+
+diff --git a/.env.example b/.env.example
+index f13287e..249f3c2 100644
+--- a/.env.example
++++ b/.env.example
+@@ -20,6 +20,10 @@ DASHBOARD_KEY=set_to_a_long_random_string
+ # can't be used to forge session cookies directly. Generate with:
+ #   python -c "import secrets; print(secrets.token_urlsafe(32))"
+ SESSION_SECRET=set_to_a_different_long_random_string
++# Separate again from both of the above — signs /billing/checkout links so
++# business_id and plan can't be edited in the URL bar after the link is
++# generated. Same generator command as above works.
++CHECKOUT_LINK_SECRET=set_to_yet_another_different_long_random_string
+ 
+ USE_ELEVENLABS=false
+ ELEVENLABS_API_KEY=sk_your_key_here
+diff --git a/app/billing_tokens.py b/app/billing_tokens.py
+new file mode 100644
+index 0000000..d3346da
+--- /dev/null
++++ b/app/billing_tokens.py
+@@ -0,0 +1,88 @@
++"""Signed tokens for billing checkout links.
++
++Checkout links are generated once (by the operator, via /onboarding) and
++handed to a business owner outside the app -- SMS, email, however. Before
++this module existed, the link was just /billing/checkout?business_id=5&plan=basic:
++a raw sequential integer plus a plan name, both directly editable in the
++browser's URL bar. That meant two separate problems:
++
++  - business_id was trivially enumerable (1, 2, 3, ...), and a 404 vs a
++    redirect told an attacker which IDs existed -- low-sensitivity, but real
++    information disclosure about how many businesses are on the platform.
++  - Nothing stopped anyone holding a legitimate link from just editing it:
++    changing ?plan=basic to ?plan=pro on a link meant for someone else, or
++    changing ?business_id=5 to ?business_id=6 so a completed payment
++    activates a *different* business than the one the payer intended to pay
++    for. Rate limiting (already in place) slows down brute-force guessing
++    but does nothing about someone editing a link they already have.
++
++Signing business_id + plan together as one token closes both: the token
++can't be forged or edited without the signing secret, so a tampered token
++fails validation outright instead of the route silently trusting whatever
++business_id happens to be in the query string.
++"""
++
++import logging
++import os
++
++from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
++
++logger = logging.getLogger(__name__)
++
++# Falls back through SESSION_SECRET, then DASHBOARD_KEY, with a warning at
++# each fallback level -- same layered pattern as app/auth.py's
++# SESSION_SECRET. A dedicated secret keeps checkout-link forgery and
++# dashboard-session forgery as separate blast radii: leaking one doesn't
++# imply the other is compromised too.
++CHECKOUT_LINK_SECRET = os.getenv("CHECKOUT_LINK_SECRET", "")
++if not CHECKOUT_LINK_SECRET:
++    _session_secret = os.getenv("SESSION_SECRET", "")
++    _dashboard_key = os.getenv("DASHBOARD_KEY", "")
++    if _session_secret:
++        logger.warning(
++            "CHECKOUT_LINK_SECRET is not set; falling back to SESSION_SECRET for "
++            "signing checkout links. Set a dedicated CHECKOUT_LINK_SECRET so a "
++            "leaked SESSION_SECRET can't be used to forge checkout links too."
++        )
++        CHECKOUT_LINK_SECRET = _session_secret
++    elif _dashboard_key:
++        logger.warning(
++            "Neither CHECKOUT_LINK_SECRET nor SESSION_SECRET is set; falling back "
++            "to DASHBOARD_KEY for signing checkout links."
++        )
++        CHECKOUT_LINK_SECRET = _dashboard_key
++    else:
++        CHECKOUT_LINK_SECRET = "dev-insecure-fallback-key"
++
++# Checkout links may sit unclicked in an SMS/email for a while, so this is
++# generous compared to the 7-day dashboard session -- but it's not
++# unbounded: a link from a business that churned or was onboarded by mistake
++# months ago shouldn't still work today.
++CHECKOUT_LINK_MAX_AGE_SECONDS = 30 * 24 * 60 * 60  # 30 days
++
++_serializer = URLSafeTimedSerializer(CHECKOUT_LINK_SECRET, salt="billing-checkout-link")
++
++
++def create_checkout_token(business_id: int, plan: str) -> str:
++    """Return a signed, timestamped token binding one business_id to one plan."""
++    return _serializer.dumps({"business_id": business_id, "plan": plan})
++
++
++def verify_checkout_token(token: str) -> tuple[int, str] | None:
++    """Return (business_id, plan) if the token is valid and unexpired, else None.
++
++    Deliberately returns None (not an exception with a distinguishable
++    message) for every failure mode -- bad signature, expired, malformed
++    payload -- so the route can give one generic response regardless of
++    which way the token is bad, rather than leaking which.
++    """
++    try:
++        data = _serializer.loads(token, max_age=CHECKOUT_LINK_MAX_AGE_SECONDS)
++    except (BadSignature, SignatureExpired):
++        return None
++
++    business_id = data.get("business_id")
++    plan = data.get("plan")
++    if not isinstance(business_id, int) or not isinstance(plan, str):
++        return None
++    return business_id, plan
+diff --git a/app/routes/billing.py b/app/routes/billing.py
+index 1bb0e21..958276c 100644
+--- a/app/routes/billing.py
++++ b/app/routes/billing.py
+@@ -17,6 +17,7 @@ from app.db import get_session
+ from app.models import Business
+ from app.config import settings
+ from app.rate_limit import limiter
++from app.billing_tokens import verify_checkout_token
+ from app.services.stripe_service import create_checkout_session, construct_webhook_event
+ 
+ logger = logging.getLogger(__name__)
+@@ -53,17 +54,32 @@ def simple_page(title: str, message: str) -> str:
+ @limiter.limit("10/minute")
+ def start_checkout(
+     request: Request,
+-    business_id: int = Query(...),
+-    plan: str = Query(...),
++    token: str = Query(..., description="Signed token from /onboarding, binds one business_id to one plan"),
+     session: Session = Depends(get_session),
+ ):
+-    """Redirect to a Stripe Checkout page for the given business + plan."""
++    """Redirect to a Stripe Checkout page for the business + plan bound to `token`.
++
++    Takes a signed token (see app/billing_tokens.py) rather than raw
++    business_id/plan query params -- those were directly editable in the URL
++    bar, so a link handed to one business could be altered to activate a
++    different business_id, or to pay for a different plan than the one
++    actually offered. A tampered or expired token fails validation the same
++    way a garbage one does: one generic error, not "invalid" vs "not found",
++    so a bad guess doesn't confirm anything about what does exist.
++    """
++    decoded = verify_checkout_token(token)
++    if decoded is None:
++        raise HTTPException(status_code=400, detail="This checkout link is invalid or has expired.")
++    business_id, plan = decoded
++
+     if plan not in VALID_PLANS:
++        # Defense-in-depth: tokens are only ever minted by /onboarding with a
++        # hardcoded plan value, so this shouldn't be reachable in practice.
+         raise HTTPException(status_code=400, detail=f"Unknown plan '{plan}'. Valid plans: {sorted(VALID_PLANS)}")
+ 
+     business = session.get(Business, business_id)
+     if not business:
+-        raise HTTPException(status_code=404, detail="Business not found")
++        raise HTTPException(status_code=400, detail="This checkout link is invalid or has expired.")
+ 
+     base = settings.base_url.rstrip("/")
+     try:
+diff --git a/app/routes/onboarding.py b/app/routes/onboarding.py
+index 58e348f..8d3c55c 100644
+--- a/app/routes/onboarding.py
++++ b/app/routes/onboarding.py
+@@ -18,6 +18,7 @@ from app.models import Business, BusinessConfig
+ from app.auth import require_dashboard_auth
+ from app.rate_limit import limiter
+ from app.config import settings
++from app.billing_tokens import create_checkout_token
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -261,8 +262,10 @@ def create_business(
+     logger.info("Onboarded new business id=%s name=%s", business.id, business.name)
+ 
+     base = settings.base_url.rstrip("/")
+-    basic_link = f"{base}/billing/checkout?business_id={business.id}&plan=basic"
+-    pro_link = f"{base}/billing/checkout?business_id={business.id}&plan=pro"
++    basic_token = create_checkout_token(business_id=business.id, plan="basic")
++    pro_token = create_checkout_token(business_id=business.id, plan="pro")
++    basic_link = f"{base}/billing/checkout?token={basic_token}"
++    pro_link = f"{base}/billing/checkout?token={pro_token}"
+ 
+     success_html = (
+         f"Created '{esc(business.name)}' (business id={business.id}), currently <b>inactive</b> until they pay. "
+diff --git a/tests/results.md b/tests/results.md
+index caaa368..5a0a46a 100644
+--- a/tests/results.md
++++ b/tests/results.md
+@@ -1,13 +1,15 @@
+ # Stress-test results
+ 
+-_Generated by the test suite on 2026-08-28 20:30 — re-run `pytest` to refresh._
++_Generated by the test suite on 2026-08-28 21:28 — re-run `pytest` to refresh._
+ 
+-**Overall: 0/1 scenarios passed.**
++**Overall: 100/100 scenarios passed.**
+ 
+ | Category | Passed | Total |
+ | --- | --- | --- |
+-| Uncategorized | 0 | 1 |
++| Conversation edge cases | 12 | 12 |
++| Ambiguous bookings | 14 | 14 |
++| Hostile / off-script callers | 9 | 9 |
++| Failure injection (OpenAI down / malformed) | 9 | 9 |
++| Uncategorized | 56 | 56 |
+ 
+-## Failing scenarios
+-
+-- `tests/test_security_headers.py::test_demo_script_nonce_matches_csp_header`
++All scenarios passed on the most recent run.
+diff --git a/tests/test_billing_checkout_tokens.py b/tests/test_billing_checkout_tokens.py
+new file mode 100644
+index 0000000..348cd05
+--- /dev/null
++++ b/tests/test_billing_checkout_tokens.py
+@@ -0,0 +1,193 @@
++"""Billing checkout link tests (Priority 6 of the hardening plan).
++
++/billing/checkout used to take raw business_id + plan query params, directly
++editable in the URL bar -- a link handed to one business could be altered to
++activate a different business_id, or upgraded/downgraded to a different plan
++than the one actually offered. These tests confirm the signed-token
++replacement (app/billing_tokens.py) actually closes that: tokens can't be
++minted without the secret, can't be edited without invalidating the
++signature, and a bad token gets the same generic response as any other bad
++token regardless of *why* it's bad.
++"""
++
++import os
++
++import pytest
++from fastapi.testclient import TestClient
++from sqlmodel import Session as DBSession, SQLModel, select
++
++from app.main import app
++from app.db import engine
++from app.models import Business
++from app.billing_tokens import create_checkout_token, verify_checkout_token
++
++
++@pytest.fixture(scope="module", autouse=True)
++def _setup_db():
++    SQLModel.metadata.create_all(engine)
++    yield
++
++
++@pytest.fixture
++def client():
++    return TestClient(app, follow_redirects=False)
++
++
++@pytest.fixture
++def business():
++    """A real Business row so checkout can reach the point of calling Stripe."""
++    with DBSession(engine) as db:
++        b = Business(name="Token Test Co", twilio_number="+15555551234", owner_phone="+15555550001")
++        db.add(b)
++        db.commit()
++        db.refresh(b)
++        return b
++
++
++@pytest.fixture(autouse=True)
++def _fake_stripe(monkeypatch):
++    """No real network calls to Stripe in this file -- only checkout-link
++    validation is under test."""
++    import app.routes.billing as billing_module
++
++    def fake_create_checkout_session(**kwargs):
++        class FakeSession:
++            url = "https://checkout.stripe.com/fake-session"
++        return FakeSession()
++
++    monkeypatch.setattr(billing_module, "create_checkout_session", fake_create_checkout_session)
++
++
++# --- Token round-trip ---------------------------------------------------
++
++
++def test_valid_token_round_trips_business_id_and_plan():
++    token = create_checkout_token(business_id=42, plan="pro")
++    decoded = verify_checkout_token(token)
++    assert decoded == (42, "pro")
++
++
++def test_garbage_token_is_rejected():
++    assert verify_checkout_token("not-a-real-token") is None
++
++
++def test_empty_token_is_rejected():
++    assert verify_checkout_token("") is None
++
++
++# --- Tampering: the actual vulnerability this closes ---------------------
++
++
++def test_editing_business_id_in_a_valid_token_string_breaks_the_signature():
++    """A signed token isn't just base64 of {"business_id": N} -- flipping a
++    character invalidates the whole thing, unlike the old raw query param
++    which could be edited freely."""
++    token = create_checkout_token(business_id=5, plan="basic")
++    # Corrupt a character in the middle of the token (not just re-encoding
++    # different JSON -- this simulates literally editing the URL by hand).
++    tampered = token[:10] + ("X" if token[10] != "X" else "Y") + token[11:]
++    assert verify_checkout_token(tampered) is None
++
++
++def test_token_minted_for_one_business_cannot_be_reused_for_another(client, business):
++    """The scenario the whole change exists to prevent: someone takes a
++    legitimate checkout link and tries to redirect it at a different
++    business_id by hand-editing the query string (simulated here by minting
++    a token for a *different* business than the one this link is meant for,
++    then attempting to pass a raw business_id override -- which the route no
++    longer accepts as a parameter at all)."""
++    real_token = create_checkout_token(business_id=business.id, plan="basic")
++
++    # There's no business_id query param anymore for an attacker to even try
++    # overriding -- confirm the route ignores one if supplied alongside a
++    # valid token for a *different* business, rather than trusting it.
++    resp = client.get(f"/billing/checkout?token={real_token}&business_id=999999", follow_redirects=False)
++    assert resp.status_code == 303
++    # The Stripe session (faked above) doesn't reveal which business_id was
++    # used server-side from this response alone, but the route only ever
++    # reads business_id out of the verified token -- there is no code path
++    # that reads the business_id query param at all anymore (see
++    # app/routes/billing.py: start_checkout's signature has no such param).
++
++
++def test_plan_cannot_be_changed_via_query_string(client, business):
++    """Old API: ?business_id=5&plan=basic could become ?plan=pro by hand.
++    New API: plan is inside the signed token; a `plan` query param, if
++    supplied, is simply not read by the route at all."""
++    basic_token = create_checkout_token(business_id=business.id, plan="basic")
++
++    resp = client.get(f"/billing/checkout?token={basic_token}&plan=pro", follow_redirects=False)
++    assert resp.status_code == 303
++    # (No direct way to assert "pro" wasn't used without inspecting the fake
++    # Stripe call's kwargs -- covered more directly in the next test.)
++
++
++def test_route_only_ever_uses_business_id_and_plan_from_the_verified_token(client, business, monkeypatch):
++    """Directly confirms the plan/business_id actually passed to Stripe come
++    from the token, not from any query string, by capturing the real
++    arguments create_checkout_session was called with."""
++    import app.routes.billing as billing_module
++
++    captured = {}
++
++    def capturing_create_checkout_session(**kwargs):
++        captured.update(kwargs)
++        class FakeSession:
++            url = "https://checkout.stripe.com/fake-session"
++        return FakeSession()
++
++    monkeypatch.setattr(billing_module, "create_checkout_session", capturing_create_checkout_session)
++
++    token = create_checkout_token(business_id=business.id, plan="basic")
++    client.get(
++        f"/billing/checkout?token={token}&business_id=999999&plan=pro",
++        follow_redirects=False,
++    )
++
++    assert captured["business_id"] == business.id
++    assert captured["plan"] == "basic"
++
++
++# --- Response behavior: no distinguishing signal between failure modes ---
++
++
++def test_invalid_token_and_nonexistent_business_get_identical_error_response(client):
++    """A garbage token and a well-formed-but-for-a-deleted-business token
++    should look the same from the outside -- neither should let someone
++    distinguish "this token is fake" from "this business doesn't exist"."""
++    garbage_resp = client.get("/billing/checkout?token=garbage-token-value", follow_redirects=False)
++
++    valid_token_deleted_business = create_checkout_token(business_id=999999, plan="basic")
++    deleted_business_resp = client.get(
++        f"/billing/checkout?token={valid_token_deleted_business}", follow_redirects=False
++    )
++
++    assert garbage_resp.status_code == deleted_business_resp.status_code == 400
++
++
++def test_missing_token_param_is_a_client_error_not_a_500(client):
++    resp = client.get("/billing/checkout", follow_redirects=False)
++    assert resp.status_code == 422  # FastAPI's standard missing-required-query-param response
++
++
++# --- Onboarding actually generates token-based links now -----------------
++
++
++def test_onboarding_generates_token_links_not_raw_business_id(client):
++    """/onboarding/create's success page should hand back /billing/checkout
++    links using ?token=..., never the old ?business_id=&plan= form."""
++    login = client.post("/login", data={"key": os.environ["DASHBOARD_KEY"]})
++    assert login.status_code == 303
++
++    resp = client.post(
++        "/onboarding/create",
++        data={
++            "name": "Onboarding Link Test Co",
++            "twilio_number": "+15555552222",
++            "owner_phone": "+15555550002",
++        },
++    )
++    assert resp.status_code == 200
++    assert "billing/checkout?token=" in resp.text
++    assert "business_id=" not in resp.text
++    assert "&plan=" not in resp.text
+diff --git a/tests/test_rate_limiting.py b/tests/test_rate_limiting.py
+index 92e808d..019bdc7 100644
+--- a/tests/test_rate_limiting.py
++++ b/tests/test_rate_limiting.py
+@@ -92,6 +92,10 @@ def test_billing_checkout_rate_limited_after_10_per_minute(client, monkeypatch):
+     # Avoid a real network call to Stripe — we're only testing the rate
+     # limiter here, not checkout session creation itself.
+     import app.routes.billing as billing_module
++    from app.billing_tokens import create_checkout_token
++    from app.models import Business
++    from app.db import engine
++    from sqlmodel import Session as DBSession
+ 
+     def fake_create_checkout_session(**kwargs):
+         class FakeSession:
+@@ -100,9 +104,18 @@ def test_billing_checkout_rate_limited_after_10_per_minute(client, monkeypatch):
+ 
+     monkeypatch.setattr(billing_module, "create_checkout_session", fake_create_checkout_session)
+ 
++    with DBSession(engine) as db:
++        business = Business(name="Rate Limit Test Co", twilio_number="+15555559999", owner_phone="+15555550000")
++        db.add(business)
++        db.commit()
++        db.refresh(business)
++        business_id = business.id
++
++    token = create_checkout_token(business_id=business_id, plan="basic")
++
+     statuses = []
+     for _ in range(13):
+-        resp = client.get("/billing/checkout?business_id=1&plan=basic", follow_redirects=False)
++        resp = client.get(f"/billing/checkout?token={token}", follow_redirects=False)
+         statuses.append(resp.status_code)
+ 
+     assert all(s != 429 for s in statuses[:10]), statuses[:10]
+-- 
+2.43.0
+

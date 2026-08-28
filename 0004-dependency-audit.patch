@@ -1,0 +1,200 @@
+From 5ba22c1d9ab0db67b7353373fc5daddd98e7f47e Mon Sep 17 00:00:00 2001
+From: srymsjackson <jstrazzo22@gmail.com>
+Date: Fri, 28 Aug 2026 22:13:30 +0000
+Subject: [PATCH] Dependency audit: patch 5 packages with known CVEs, add
+ version-floor tests
+
+pip-audit found 20 known CVEs across aiohttp, starlette, python-dotenv, and
+python-multipart at the versions previously pinned. Bumped:
+
+  aiohttp          3.14.1 -> 3.14.3
+  python-dotenv    1.0.1  -> 1.2.2
+  python-multipart 0.0.9  -> 0.0.32
+  fastapi          0.115.0 -> 0.118.0  (see below)
+  starlette        0.38.6  -> 0.48.0   (see below)
+
+fastapi and starlette had to move together: fastapi==0.115.0 pins
+starlette<0.39.0, and 0.38.6 -- the version we were on -- is already the
+newest patch release in that range, so none of starlette's CVE fixes were
+reachable without bumping fastapi too. Went with the smallest fastapi bump
+that unlocks a patched starlette range (0.118.0 -> starlette<0.49.0) rather
+than jumping to current-latest fastapi (0.141.x at time of writing), to keep
+this a low-risk dependency patch rather than a framework migration.
+
+This closes the one finding with real reachable exposure in this app:
+PYSEC-2026-1943, unbounded in-memory buffering of multipart text fields.
+app/security.py's verify_twilio_signature() calls request.form() to build
+params for the HMAC check before the signature itself is validated -- so
+this parsing happens for any POST to /voice/incoming, /voice/collect, or
+/voice/status regardless of whether the caller has a valid signature,
+making it reachable by unauthenticated traffic on public webhook endpoints,
+not just authenticated routes.
+
+Starlette still has unpatched findings requiring starlette>=1.0.1 (Host
+header URL-reconstruction issues, a Windows-only StaticFiles SSRF, an
+HTTPEndpoint dispatch quirk, a FileResponse Range-header DoS), which needs
+a much larger fastapi jump. Checked each against this app's actual code:
+no StaticFiles, no FileResponse, no HTTPEndpoint routing, and the two
+places that do read request.url (app/main.py's login-redirect builder,
+app/security.py's Twilio signature URL) don't use it for a security
+decision -- security.py explicitly builds the signature-check URL from the
+trusted configured BASE_URL, not request.url, precisely to avoid trusting
+attacker-influenced request data. Judged the residual risk low enough not
+to justify a framework-version jump in the same patch as everything else
+here; worth a dedicated pass later with its own full regression testing,
+particularly given app.on_event is already deprecated and may require
+migrating to lifespan handlers at some point.
+
+Also converted requirements.txt from UTF-16 to UTF-8 -- the original
+encoding was invisible in a normal editor but broke grep/git diff/every
+text tool that assumes UTF-8, which is how the dependency versions had to
+be read via a manual UTF-16 decode during this audit in the first place.
+No content changed beyond that and the 5 version bumps.
+
+Tests: tests/test_dependency_versions.py (5 new tests) -- asserts each
+patched package is at or above its fixed-version floor, so a future
+accidental downgrade (e.g. resolving a dependency conflict by pinning an
+older version) fails CI instead of silently reintroducing a fixed CVE.
+Verified by downgrading starlette back to 0.38.6 and re-running: fails as
+expected, with a message pointing at why. Full suite: 105/105 passing,
+verified via a completely clean venv installed only from the final
+requirements.txt (not just the dev venv these changes were made in).
+---
+ requirements.txt                  | Bin 1730 -> 865 bytes
+ tests/results.md                  |   6 +--
+ tests/test_dependency_versions.py |  68 ++++++++++++++++++++++++++++++
+ 3 files changed, 71 insertions(+), 3 deletions(-)
+ create mode 100644 tests/test_dependency_versions.py
+
+diff --git a/requirements.txt b/requirements.txt
+index d9efcb8237f224480fe205041eca8f94815050af..0d6cca5931fb297d7012e59f59a80433bc5d2abc 100644
+GIT binary patch
+literal 865
+zcmX|9%Wm5+5WMqWOpubS*asbQEmELG3lu#CG)3FnP$W&#c9gI0Eb}<->}zIr4aKub
+zX?3eR81Kt8b#j!QFu-d~o9t>{8Qe?#2~JZl^&oqW3!Q@T)1>7fl`tX1YO0$zbxjV#
+zlzeFLN^zP7?!uH>Gw&ItM$Woi=}3qb5MU3&o=q;UZbHn9@$}|0ZyY2tp6tss?GSXr
+zMjx|T3~w3aC}t`(V~qw^C7gFR7rZ$%Nn2)jG^Lt^RZ42TV<5*j)S!>M7&&DJz#;DC
+z7CX*bxAGA=_QS^PxK_!1i))PRnQF~k@XA5AgG`zOsKKe7pju`VPA<o5W7A>UKdP(?
+zRJMpbEhw6%Z5y;)eWjT!XpAsWi<n$6?2#N;NXju;W6z+X8qHKz8`G)V94MHtdvzkM
+z*jveRr-p@J!1KEh%o~CJSik-G{ZWJIYdy!XnPYX~#$r1d@c}kw$z(87Frn|z`}gtt
+z6B9)!vb$VeVI`gH`AEgb`={qpD^UU+kNgZ;!W!}G=hLHykfr??#As12eu=ZgPw|Eh
+zBdW<bNo{Hez7p<CiSMw*!zfWN^TOXX?!chl$@Ba@=63>bNa3`hP?EEiV&JLF>pk)8
+zULmpo2V?vupW>Rmr$f&Q_;;^2f>*7tSNO8KsrGy%&)?0~C~<d(677p))tdRN;M<bC
+F=sy`D1c3km
+
+literal 1730
+zcmZvdPfy!W5XASK?*fYB0OimF*Q%9TwNlj+%Kx||wy~Xp`{CQpZ#ORvP(_B|-8VZk
+zyZiY2XJ&;}wzZkn`t-K)XRg0@`n2|5pNU=CwVsKM^gi-C>y&?CjZSp>*`G3Rm6^TC
+z1Sj{%^hLZC-o{F=M^2_F8DmE%6{&<j)3dUr>UFAA>w7R8EA!?oyLWcrM3tcye4CRV
+z)KG~k3!ycN7Pi(CddJdAPUPKq79N3s-V5i|*xq>;_S-R%Myke{oe&rH;HdBPmIy8`
+zq-v+9(Rna9i5BA5iZ6Apb;gy);EJ#CUFqb?e(5RoZD#Y6s!O{%dAC*s1o|4Pz|Zu#
+zI^wKVy>jN@L_K&=3$E1KC}(x7gzlse40LQAF|p6wFV1b1%Y2{{goF!++p~D5I8F@R
+zOqCPDv!CVM#91*}h5TV+5}QmB-gd%S>U}BR^t7_WnKw)^+<tl{@qu^p1RwTCB%-`e
+zjP^p?sRq^QYPi9KFoE!@d@^B{=7^5cQ|i{v2v25uwntY`mfWnxws+5JDVS)==0XDR
+z?SA1t`x<&-wQxPC%zV?P|H-&_^wbe@r`|JiKMU=HeYbC~aDsa;y;~_P#cHYF>|?1Z
+zJnt+Xz-h=FJgZ$rc!uUQ2~_=IclOCXIu?Es%Y_BcN4d_n(_3o6Id@NSpjAgIdlL4`
+zDaQkNx8lfNv)RKY#XU5#ul7Y%?}QQk*o#Z55q&{XD-JtNMJ3(r9vMl&#J3>!tWk^|
+z!I_kk`}DBUvCV~erfs0>p?0J*k3!%3xwr$EIy~s4t`KtK&n*Cd)W==OglyCmez%U#
+zY?5D|c%*yh{KUPOJS&qvato6m9+N%X69@Hy{{@AnF?U3IkZ#?BW`Nma&xd-sJA`g}
+n)49L&0EeOmw+uLR=}B+7#VX}J=zHq*aG&%(J>h+vOp5*i#w7+%
+
+diff --git a/tests/results.md b/tests/results.md
+index 5a0a46a..75f4a7e 100644
+--- a/tests/results.md
++++ b/tests/results.md
+@@ -1,8 +1,8 @@
+ # Stress-test results
+ 
+-_Generated by the test suite on 2026-08-28 21:28 — re-run `pytest` to refresh._
++_Generated by the test suite on 2026-08-28 22:13 — re-run `pytest` to refresh._
+ 
+-**Overall: 100/100 scenarios passed.**
++**Overall: 105/105 scenarios passed.**
+ 
+ | Category | Passed | Total |
+ | --- | --- | --- |
+@@ -10,6 +10,6 @@ _Generated by the test suite on 2026-08-28 21:28 — re-run `pytest` to refresh.
+ | Ambiguous bookings | 14 | 14 |
+ | Hostile / off-script callers | 9 | 9 |
+ | Failure injection (OpenAI down / malformed) | 9 | 9 |
+-| Uncategorized | 56 | 56 |
++| Uncategorized | 61 | 61 |
+ 
+ All scenarios passed on the most recent run.
+diff --git a/tests/test_dependency_versions.py b/tests/test_dependency_versions.py
+new file mode 100644
+index 0000000..75bdd37
+--- /dev/null
++++ b/tests/test_dependency_versions.py
+@@ -0,0 +1,68 @@
++"""Dependency version floor tests (Priority 7 of the hardening plan).
++
++A pip-audit pass (2026-08-28) found 20 known CVEs across aiohttp, starlette,
++python-dotenv, and python-multipart at the versions previously pinned in
++requirements.txt. All four were bumped to versions with the relevant fixes
++available. fastapi was bumped alongside starlette since starlette's version
++is constrained by whichever fastapi version is installed
++(fastapi==0.115.0 requires starlette<0.39.0, which has no patched release in
++range -- the CVEs are only reachable by moving both together).
++
++These tests don't re-verify the CVEs themselves (that's pip-audit's job, and
++it should be re-run periodically, not just once). What they guard against is
++a *regression*: someone bumping a requirement back down without noticing --
++e.g. resolving a dependency conflict by pinning an older version, or a merge
++that reintroduces a stale requirements.txt. A version floor test fails loudly
++in CI if that happens, rather than silently reintroducing a fixed CVE.
++
++Starlette's remaining unpatched findings at the time of this pass (Host
++header URL-reconstruction issues, a Windows-only StaticFiles SSRF, an
++HTTPEndpoint dispatch quirk, a FileResponse Range-header DoS) all require
++starlette>=1.0.1, which needs a much newer fastapi than this app currently
++runs -- and this app doesn't use StaticFiles, FileResponse, or Starlette's
++class-based HTTPEndpoint routing, and doesn't make security decisions based
++on request.url (Twilio signature verification explicitly uses the trusted
++configured BASE_URL, not request.url -- see app/security.py), so the
++practical exposure from staying below 1.0.1 was judged low relative to the
++risk of a larger, less-tested version jump. That's a judgment call to
++revisit later, not a settled fact -- worth another look at a natural
++upgrade point.
++"""
++
++import importlib.metadata
++
++import pytest
++
++
++MINIMUM_VERSIONS = {
++    "aiohttp": (3, 14, 3),
++    "fastapi": (0, 118, 0),
++    "python-dotenv": (1, 2, 2),
++    "python-multipart": (0, 0, 20),  # anything >=0.0.20 covers the found CVEs
++    "starlette": (0, 48, 0),
++}
++
++
++def _version_tuple(version_str: str) -> tuple:
++    """Parse a dotted version string into a comparable tuple of ints,
++    ignoring any pre-release/build suffix (e.g. "1.2.3rc1" -> (1, 2, 3))."""
++    parts = []
++    for chunk in version_str.split("."):
++        digits = ""
++        for ch in chunk:
++            if ch.isdigit():
++                digits += ch
++            else:
++                break
++        parts.append(int(digits) if digits else 0)
++    return tuple(parts)
++
++
++@pytest.mark.parametrize("package_name,minimum", sorted(MINIMUM_VERSIONS.items()))
++def test_package_meets_security_floor(package_name, minimum):
++    installed = importlib.metadata.version(package_name)
++    assert _version_tuple(installed) >= minimum, (
++        f"{package_name} {installed} is below the {'.'.join(map(str, minimum))} security "
++        f"floor set after the 2026-08-28 pip-audit pass -- check whether the CVEs that "
++        f"prompted the original bump apply again before downgrading."
++    )
+-- 
+2.43.0
+
