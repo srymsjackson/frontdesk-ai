@@ -13,6 +13,7 @@ from app.config import settings
 from app.db import create_db_and_tables
 from app.auth import NotAuthenticated
 from app.rate_limit import limiter
+from app.security_headers import SecurityHeadersMiddleware
 from app.routes.voice import router as voice_router
 from app.routes.dashboard import router as dashboard_router
 from app.routes.demo import router as demo_router
@@ -21,6 +22,8 @@ from app.routes.billing import router as billing_router
 from app.routes.auth_routes import router as auth_router
 
 app = FastAPI(title=settings.app_name)
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)

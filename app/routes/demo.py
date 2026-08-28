@@ -89,15 +89,16 @@ async def voice_status(request: Request) -> Response:
 # ── Demo page ─────────────────────────────────────────────────────────────────
 
 @router.get("/demo", response_class=HTMLResponse)
-async def demo_page() -> HTMLResponse:
+async def demo_page(request: Request) -> HTMLResponse:
     html = _build_demo_html(
         phone_display=DEMO_PHONE_DISPLAY,
         phone_tel=DEMO_PHONE_TEL,
+        csp_nonce=request.state.csp_nonce,
     )
     return HTMLResponse(content=html)
 
 
-def _build_demo_html(phone_display: str, phone_tel: str) -> str:
+def _build_demo_html(phone_display: str, phone_tel: str, csp_nonce: str) -> str:
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -592,7 +593,7 @@ def _build_demo_html(phone_display: str, phone_tel: str) -> str:
     Built by <a href="https://strazzo.io" target="_blank">Strazzo LLC</a> &nbsp;&middot;&nbsp; AI receptionists for small business
   </footer>
 
-  <script>
+  <script nonce="{csp_nonce}">
     // ── Phone number typewriter effect ─────────────────────────────────────
     // The signature element: digits appear one-by-one, like dialing in.
     const PHONE_DISPLAY = "{phone_display}";
