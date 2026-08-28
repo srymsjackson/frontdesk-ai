@@ -7,9 +7,12 @@ when the app starts.
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 from urllib.parse import quote
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from app.config import settings
 from app.db import create_db_and_tables
 from app.auth import NotAuthenticated
+from app.rate_limit import limiter
 from app.routes.voice import router as voice_router
 from app.routes.sms import router as sms_router
 from app.routes.leads import router as leads_router
@@ -21,6 +24,9 @@ from app.routes.billing import router as billing_router
 from app.routes.auth_routes import router as auth_router
 
 app = FastAPI(title=settings.app_name)
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 @app.exception_handler(NotAuthenticated)

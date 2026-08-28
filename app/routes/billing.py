@@ -16,6 +16,7 @@ import stripe
 from app.db import get_session
 from app.models import Business
 from app.config import settings
+from app.rate_limit import limiter
 from app.services.stripe_service import create_checkout_session, construct_webhook_event
 
 logger = logging.getLogger(__name__)
@@ -49,7 +50,9 @@ def simple_page(title: str, message: str) -> str:
 
 
 @router.get("/checkout")
+@limiter.limit("10/minute")
 def start_checkout(
+    request: Request,
     business_id: int = Query(...),
     plan: str = Query(...),
     session: Session = Depends(get_session),

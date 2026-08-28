@@ -9,13 +9,14 @@ hand-built in a Python shell.
 import html
 import json
 import logging
-from fastapi import APIRouter, Depends, Form
+from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse
 from sqlmodel import Session, select
 
 from app.db import get_session
 from app.models import Business, BusinessConfig
 from app.auth import require_dashboard_auth
+from app.rate_limit import limiter
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -176,7 +177,9 @@ def intake_form(_auth: None = Depends(require_dashboard_auth)):
 
 
 @router.post("/create", response_class=HTMLResponse)
+@limiter.limit("5/minute")
 def create_business(
+    request: Request,
     name: str = Form(...),
     twilio_number: str = Form(...),
     owner_phone: str = Form(...),

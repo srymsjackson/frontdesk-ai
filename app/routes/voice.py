@@ -1,7 +1,7 @@
 """Voice webhook endpoints that collect lead details over multi-turn calls."""
 
 import logging
-from fastapi import APIRouter, Depends, Form, Response
+from fastapi import APIRouter, Depends, Form, Request, Response
 from sqlmodel import Session
 from sqlmodel import select
 from app.models import Business
@@ -20,6 +20,7 @@ from fastapi.responses import Response as FastAPIResponse
 from app.services.voice_service import generate_audio, get_audio
 from app.services.twilio_service import send_sms
 from app.security import verify_twilio_signature
+from app.rate_limit import limiter
 import asyncio
 from datetime import datetime, timezone
 from ..websocket_manager import manager
@@ -96,7 +97,9 @@ def empty_state():
 
 
 @router.post("/incoming", dependencies=[Depends(verify_twilio_signature)])
+@limiter.limit("30/minute")
 async def incoming_call(
+    request: Request,
     session: Session = Depends(get_session),
     From: str = Form(default=""),
     To: str = Form(default=""),
@@ -152,7 +155,9 @@ async def incoming_call(
 
 
 @router.post("/collect", dependencies=[Depends(verify_twilio_signature)])
+@limiter.limit("60/minute")
 async def collect_turn(
+    request: Request,
     session: Session = Depends(get_session),
     From: str = Form(default=""),
     SpeechResult: str = Form(default=""),

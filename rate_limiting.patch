@@ -1,0 +1,326 @@
+diff --git a/app/main.py b/app/main.py
+index 0f023e9..8500cb4 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -7,9 +7,12 @@ when the app starts.
+ from fastapi import FastAPI
+ from fastapi.responses import RedirectResponse
+ from urllib.parse import quote
++from slowapi import _rate_limit_exceeded_handler
++from slowapi.errors import RateLimitExceeded
+ from app.config import settings
+ from app.db import create_db_and_tables
+ from app.auth import NotAuthenticated
++from app.rate_limit import limiter
+ from app.routes.voice import router as voice_router
+ from app.routes.sms import router as sms_router
+ from app.routes.leads import router as leads_router
+@@ -22,6 +25,9 @@ from app.routes.auth_routes import router as auth_router
+ 
+ app = FastAPI(title=settings.app_name)
+ 
++app.state.limiter = limiter
++app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
++
+ 
+ @app.exception_handler(NotAuthenticated)
+ def not_authenticated_handler(request, exc):
+diff --git a/app/rate_limit.py b/app/rate_limit.py
+new file mode 100644
+index 0000000..f5baf6d
+--- /dev/null
++++ b/app/rate_limit.py
+@@ -0,0 +1,44 @@
++"""Rate limiting: caps request volume on public-facing / abuse-prone routes.
++
++On /voice/*, Twilio's own signature validation (app/security.py) is the
++*primary* defense — an unsigned or forged request never reaches the route at
++all. Rate limiting here is defense-in-depth on top of that: it caps damage if
++a genuinely valid signature is ever replayed (Twilio's signature scheme has
++no nonce/timestamp, so a captured valid request could technically be resent),
++and it caps runaway cost if something upstream misbehaves and hammers us with
++otherwise-legitimate-looking traffic.
++
++On /onboarding/create and /billing/checkout, it's a more direct defense:
++onboarding is behind the dashboard login now (see app/auth.py), so this is a
++backstop against a compromised session rather than the primary control;
++checkout has no auth at all (customers reach it via a link in an SMS), so
++this is the main thing standing between it and someone scripting repeated
++Stripe Checkout Session creation against a guessed/enumerated business_id.
++"""
++
++from fastapi import Request
++from slowapi import Limiter
++from slowapi.util import get_remote_address
++
++
++def client_ip_key(request: Request) -> str:
++    """Identify the caller for rate-limiting purposes.
++
++    This app deploys on Railway, which sits behind a single trusted edge
++    proxy that sets X-Forwarded-For with the real client IP as the leftmost
++    entry (Railway's own guidance: that header is proxy-controlled and safe
++    to rely on for this deployment shape). Locally, with no proxy in front,
++    there's no X-Forwarded-For, so this falls back to the direct connection.
++
++    NOTE: slowapi ships a built-in get_ipaddr() that looks the header up as
++    "X_FORWARDED_FOR" (underscores) — that never matches the real
++    "X-Forwarded-For" HTTP header name, so it silently always falls through
++    to the direct-connection IP. Don't swap this out for that one.
++    """
++    forwarded = request.headers.get("X-Forwarded-For")
++    if forwarded:
++        return forwarded.split(",")[0].strip()
++    return get_remote_address(request)
++
++
++limiter = Limiter(key_func=client_ip_key)
+diff --git a/app/routes/billing.py b/app/routes/billing.py
+index 86c5868..1bb0e21 100644
+--- a/app/routes/billing.py
++++ b/app/routes/billing.py
+@@ -16,6 +16,7 @@ import stripe
+ from app.db import get_session
+ from app.models import Business
+ from app.config import settings
++from app.rate_limit import limiter
+ from app.services.stripe_service import create_checkout_session, construct_webhook_event
+ 
+ logger = logging.getLogger(__name__)
+@@ -49,7 +50,9 @@ def simple_page(title: str, message: str) -> str:
+ 
+ 
+ @router.get("/checkout")
++@limiter.limit("10/minute")
+ def start_checkout(
++    request: Request,
+     business_id: int = Query(...),
+     plan: str = Query(...),
+     session: Session = Depends(get_session),
+diff --git a/app/routes/onboarding.py b/app/routes/onboarding.py
+index 09e22fd..58e348f 100644
+--- a/app/routes/onboarding.py
++++ b/app/routes/onboarding.py
+@@ -9,13 +9,14 @@ hand-built in a Python shell.
+ import html
+ import json
+ import logging
+-from fastapi import APIRouter, Depends, Form
++from fastapi import APIRouter, Depends, Form, Request
+ from fastapi.responses import HTMLResponse
+ from sqlmodel import Session, select
+ 
+ from app.db import get_session
+ from app.models import Business, BusinessConfig
+ from app.auth import require_dashboard_auth
++from app.rate_limit import limiter
+ from app.config import settings
+ 
+ logger = logging.getLogger(__name__)
+@@ -176,7 +177,9 @@ def intake_form(_auth: None = Depends(require_dashboard_auth)):
+ 
+ 
+ @router.post("/create", response_class=HTMLResponse)
++@limiter.limit("5/minute")
+ def create_business(
++    request: Request,
+     name: str = Form(...),
+     twilio_number: str = Form(...),
+     owner_phone: str = Form(...),
+diff --git a/app/routes/voice.py b/app/routes/voice.py
+index df00eb1..2075271 100644
+--- a/app/routes/voice.py
++++ b/app/routes/voice.py
+@@ -1,7 +1,7 @@
+ """Voice webhook endpoints that collect lead details over multi-turn calls."""
+ 
+ import logging
+-from fastapi import APIRouter, Depends, Form, Response
++from fastapi import APIRouter, Depends, Form, Request, Response
+ from sqlmodel import Session
+ from sqlmodel import select
+ from app.models import Business
+@@ -20,6 +20,7 @@ from fastapi.responses import Response as FastAPIResponse
+ from app.services.voice_service import generate_audio, get_audio
+ from app.services.twilio_service import send_sms
+ from app.security import verify_twilio_signature
++from app.rate_limit import limiter
+ import asyncio
+ from datetime import datetime, timezone
+ from ..websocket_manager import manager
+@@ -96,7 +97,9 @@ def empty_state():
+ 
+ 
+ @router.post("/incoming", dependencies=[Depends(verify_twilio_signature)])
++@limiter.limit("30/minute")
+ async def incoming_call(
++    request: Request,
+     session: Session = Depends(get_session),
+     From: str = Form(default=""),
+     To: str = Form(default=""),
+@@ -152,7 +155,9 @@ async def incoming_call(
+ 
+ 
+ @router.post("/collect", dependencies=[Depends(verify_twilio_signature)])
++@limiter.limit("60/minute")
+ async def collect_turn(
++    request: Request,
+     session: Session = Depends(get_session),
+     From: str = Form(default=""),
+     SpeechResult: str = Form(default=""),
+diff --git a/requirements.txt b/requirements.txt
+index b350948a6924f59faa7a7001c3372b9bdc758d64..d9efcb8237f224480fe205041eca8f94815050af 100644
+GIT binary patch
+delta 67
+zcmZqUJ;b{~fLSz$A(J5&h)WoX8Ek>jltGWdVlyZ6Tt?{}hJ1!{hD3$}pfpIz04QY$
+M#s-@gvOHx30N}|DyZ`_I
+
+delta 17
+ZcmX@a+s3;=fO)eH^EAfIk60cs0su9-1{nYV
+
+diff --git a/tests/results.md b/tests/results.md
+index 3d960b5..9a44253 100644
+--- a/tests/results.md
++++ b/tests/results.md
+@@ -1,8 +1,8 @@
+ # Stress-test results
+ 
+-_Generated by the test suite on 2026-08-28 18:20 — re-run `pytest` to refresh._
++_Generated by the test suite on 2026-08-28 18:29 — re-run `pytest` to refresh._
+ 
+-**Overall: 56/56 scenarios passed.**
++**Overall: 60/60 scenarios passed.**
+ 
+ | Category | Passed | Total |
+ | --- | --- | --- |
+@@ -10,6 +10,6 @@ _Generated by the test suite on 2026-08-28 18:20 — re-run `pytest` to refresh.
+ | Ambiguous bookings | 14 | 14 |
+ | Hostile / off-script callers | 9 | 9 |
+ | Failure injection (OpenAI down / malformed) | 9 | 9 |
+-| Uncategorized | 12 | 12 |
++| Uncategorized | 16 | 16 |
+ 
+ All scenarios passed on the most recent run.
+diff --git a/tests/test_rate_limiting.py b/tests/test_rate_limiting.py
+new file mode 100644
+index 0000000..c6e09e8
+--- /dev/null
++++ b/tests/test_rate_limiting.py
+@@ -0,0 +1,117 @@
++"""Rate limiting tests (Priority 2C of the hardening plan).
++
++Confirms each newly-limited endpoint actually returns 429 once its cap is
++exceeded — not just that the decorator is present in the code. Each test
++resets the shared in-memory limiter state first so results don't depend on
++what other tests happened to hit earlier in the session.
++"""
++
++import os
++import pytest
++from fastapi.testclient import TestClient
++from twilio.request_validator import RequestValidator
++
++from app.main import app
++from app.config import settings
++from app.rate_limit import limiter
++from app.db import engine
++from sqlmodel import SQLModel
++
++
++@pytest.fixture(scope="module", autouse=True)
++def _setup_db():
++    SQLModel.metadata.create_all(engine)
++    yield
++
++
++@pytest.fixture(autouse=True)
++def _reset_rate_limits():
++    """Every test starts with a clean rate-limit counter, regardless of what
++    other tests (in this file or others) hit before it."""
++    limiter.reset()
++    yield
++
++
++@pytest.fixture
++def client():
++    return TestClient(app, follow_redirects=False)
++
++
++def _twilio_signature(url: str, params: dict) -> str:
++    validator = RequestValidator(settings.twilio_auth_token)
++    return validator.compute_signature(url, params)
++
++
++def test_voice_incoming_rate_limited_after_30_per_minute(client):
++    url = f"{settings.base_url}/voice/incoming"
++    statuses = []
++    for i in range(35):
++        params = {"From": "+15550001111", "To": "+15559998888", "CallSid": f"CA{i:04d}"}
++        sig = _twilio_signature(url, params)
++        resp = client.post("/voice/incoming", data=params, headers={"X-Twilio-Signature": sig})
++        statuses.append(resp.status_code)
++
++    # First 30 should all pass Twilio auth and reach the route (200 TwiML,
++    # "business not configured" since no matching Business row exists).
++    assert all(s == 200 for s in statuses[:30]), statuses[:30]
++    # Everything past the 30/minute cap should be rejected by the limiter.
++    assert all(s == 429 for s in statuses[30:]), statuses[30:]
++
++
++def test_voice_collect_rate_limited_after_60_per_minute(client):
++    url = f"{settings.base_url}/voice/collect"
++    statuses = []
++    for i in range(65):
++        params = {"From": "+15550001111", "SpeechResult": f"turn {i}"}
++        sig = _twilio_signature(url, params)
++        resp = client.post("/voice/collect", data=params, headers={"X-Twilio-Signature": sig})
++        statuses.append(resp.status_code)
++
++    assert all(s != 429 for s in statuses[:60]), statuses[:60]
++    assert all(s == 429 for s in statuses[60:]), statuses[60:]
++
++
++def test_onboarding_create_rate_limited_after_5_per_minute(client):
++    # Log in first — /onboarding/create sits behind require_dashboard_auth.
++    login = client.post("/login", data={"key": settings_dashboard_key()})
++    assert login.status_code == 303
++
++    statuses = []
++    for i in range(8):
++        resp = client.post(
++            "/onboarding/create",
++            data={
++                "name": f"Test Biz {i}",
++                "twilio_number": f"+1555000{i:04d}",
++                "owner_phone": "+15555550000",
++            },
++        )
++        statuses.append(resp.status_code)
++
++    assert all(s != 429 for s in statuses[:5]), statuses[:5]
++    assert all(s == 429 for s in statuses[5:]), statuses[5:]
++
++
++def test_billing_checkout_rate_limited_after_10_per_minute(client, monkeypatch):
++    # Avoid a real network call to Stripe — we're only testing the rate
++    # limiter here, not checkout session creation itself.
++    import app.routes.billing as billing_module
++
++    def fake_create_checkout_session(**kwargs):
++        class FakeSession:
++            url = "https://checkout.stripe.com/fake-session"
++        return FakeSession()
++
++    monkeypatch.setattr(billing_module, "create_checkout_session", fake_create_checkout_session)
++
++    statuses = []
++    for _ in range(13):
++        resp = client.get("/billing/checkout?business_id=1&plan=basic", follow_redirects=False)
++        statuses.append(resp.status_code)
++
++    assert all(s != 429 for s in statuses[:10]), statuses[:10]
++    assert all(s == 429 for s in statuses[10:]), statuses[10:]
++
++
++def settings_dashboard_key() -> str:
++    return os.environ["DASHBOARD_KEY"]
