@@ -126,11 +126,9 @@ uvicorn app.main:app --reload
 
 To receive real calls locally, expose the app with a tunnel (e.g. `ngrok http 8000`) and point the Twilio number's voice webhook at `<tunnel-url>/voice/incoming`.
 
-Visit `/demo` for the public live-activity page, or `/dashboard/leads?key=<DASHBOARD_KEY>` for the internal lead list.
+Visit `/demo` for the public live-activity page, or `/dashboard/leads` for the internal lead list (log in at `/login` with `DASHBOARD_KEY`).
 
 ## Known limitations / next steps
 
 - **Call state is in-process memory.** `CALL_STATE` in `voice.py` is fine for a single Railway instance but wouldn't survive a restart mid-call or horizontal scaling — a Redis-backed store is the natural next step, noted directly in the code.
-- **Outbound SMS is stubbed in the demo build.** `twilio_service.send_sms` is fully implemented but commented out to avoid sending real texts from a portfolio deployment; re-enabling it requires an upgraded Twilio account (and A2P 10DLC registration for US traffic).
-- **Dashboard auth is demo-grade.** The `?key=` query-string check is intentionally minimal for a portfolio demo; a production deployment would move to session-based auth (a key in a URL gets logged by servers, proxies, and browser history).
 - **Latency isn't formally benchmarked yet** (see Performance).

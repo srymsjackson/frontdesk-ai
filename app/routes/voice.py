@@ -1,6 +1,7 @@
 """Voice webhook endpoints that collect lead details over multi-turn calls."""
 
 import logging
+import re
 from fastapi import APIRouter, Depends, Form, Request, Response
 from sqlmodel import Session
 from sqlmodel import select
@@ -48,6 +49,20 @@ def _display_name(full_name: str | None) -> str:
     if len(parts) == 1:
         return parts[0]
     return f"{parts[0]} {parts[-1][0]}."
+
+
+def _mask_phone(phone: str | None) -> str:
+    """Reduce a phone number to its last 4 digits for the public demo
+    broadcast (/ws/leads has no auth — see app/routes/demo.py). The full
+    number must never reach that channel; masking client-side only isn't
+    enough since the raw value would still be visible in the WebSocket
+    frame to anyone inspecting network traffic on the public /demo page."""
+    if not phone:
+        return "(***) ***-****"
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) >= 4:
+        return f"+1 (***) ***-{digits[-4:]}"
+    return "(***) ***-****"
 
 
 def gather_response(prompt_text: str, action_path: str) -> str:
@@ -253,7 +268,7 @@ async def collect_turn(
         "type": "new_lead",
         "data": {
             "name": _display_name(lead.caller_name),
-            "phone": lead.phone_number or "",
+            "phone": _mask_phone(lead.phone_number),
             "service": lead.service_requested or "Inquiry",
             "preferred_time": lead.preferred_time or "",
             "timestamp": datetime.now(timezone.utc).isoformat(),

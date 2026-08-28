@@ -14,9 +14,6 @@ from app.db import create_db_and_tables
 from app.auth import NotAuthenticated
 from app.rate_limit import limiter
 from app.routes.voice import router as voice_router
-from app.routes.sms import router as sms_router
-from app.routes.leads import router as leads_router
-from app.routes.calls import router as calls_router
 from app.routes.dashboard import router as dashboard_router
 from app.routes.demo import router as demo_router
 from app.routes.onboarding import router as onboarding_router
@@ -52,9 +49,6 @@ def health():
 
 
 app.include_router(voice_router)
-app.include_router(sms_router)
-app.include_router(leads_router)
-app.include_router(calls_router)
 app.include_router(dashboard_router)
 app.include_router(demo_router)
 app.include_router(onboarding_router)

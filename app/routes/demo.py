@@ -637,12 +637,15 @@ def _build_demo_html(phone_display: str, phone_tel: str) -> str:
       return name.trim().split(/\s+/).map(p => p[0]).join('').toUpperCase().slice(0, 2);
     }}
 
-    function maskPhone(raw) {{
-      const digits = (raw || '').replace(/\D/g, '');
-      if (digits.length >= 10) {{
-        return `+1 (***) ***-${{digits.slice(-4)}}`;
-      }}
-      return '(***) ***-****';
+    // Caller-supplied fields (name, service, preferred_time) come from AI
+    // transcription of live phone calls, so they're untrusted text. This
+    // page renders lead cards via innerHTML for a WebSocket feed with no
+    // auth, so every such field must be escaped before interpolation —
+    // never trust that voice-transcribed text can't contain HTML.
+    function escapeHtml(value) {{
+      const div = document.createElement('div');
+      div.textContent = value == null ? '' : String(value);
+      return div.innerHTML;
     }}
 
     function relativeTime(isoStr) {{
@@ -663,17 +666,21 @@ def _build_demo_html(phone_display: str, phone_tel: str) -> str:
       const idx  = hashName(name);
       const [fg, bg] = AVATAR_COLORS[idx];
 
+      // The server already reduces the phone number to its last 4 digits
+      // before it ever reaches this unauthenticated channel — see
+      // _mask_phone() in app/routes/voice.py. Nothing here re-derives or
+      // widens it; this page only displays whatever the server sent.
       const card = document.createElement('div');
       card.className = 'lead-card new';
       card.innerHTML = `
-        <div class="lead-avatar" style="background:${{bg}};color:${{fg}}">${{initials(name)}}</div>
+        <div class="lead-avatar" style="background:${{bg}};color:${{fg}}">${{escapeHtml(initials(name))}}</div>
         <div class="lead-body">
-          <div class="lead-name">${{name}}</div>
+          <div class="lead-name">${{escapeHtml(name)}}</div>
           <div class="lead-meta">
-            ${{data.service ? `<span class="service-pill">${{data.service}}</span>` : ''}}
-            ${{data.preferred_time ? `<span class="lead-time-req">${{data.preferred_time}}</span>` : ''}}
+            ${{data.service ? `<span class="service-pill">${{escapeHtml(data.service)}}</span>` : ''}}
+            ${{data.preferred_time ? `<span class="lead-time-req">${{escapeHtml(data.preferred_time)}}</span>` : ''}}
           </div>
-          <div class="lead-phone">${{maskPhone(data.phone)}}</div>
+          <div class="lead-phone">${{escapeHtml(data.phone || '(***) ***-****')}}</div>
         </div>
         <div class="lead-ts">${{relativeTime(data.timestamp || new Date().toISOString())}}</div>
       `;

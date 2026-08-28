@@ -1,0 +1,490 @@
+diff --git a/README.md b/README.md
+index 37c6738..8d89ea0 100644
+--- a/README.md
++++ b/README.md
+@@ -126,11 +126,9 @@ uvicorn app.main:app --reload
+ 
+ To receive real calls locally, expose the app with a tunnel (e.g. `ngrok http 8000`) and point the Twilio number's voice webhook at `<tunnel-url>/voice/incoming`.
+ 
+-Visit `/demo` for the public live-activity page, or `/dashboard/leads?key=<DASHBOARD_KEY>` for the internal lead list.
++Visit `/demo` for the public live-activity page, or `/dashboard/leads` for the internal lead list (log in at `/login` with `DASHBOARD_KEY`).
+ 
+ ## Known limitations / next steps
+ 
+ - **Call state is in-process memory.** `CALL_STATE` in `voice.py` is fine for a single Railway instance but wouldn't survive a restart mid-call or horizontal scaling — a Redis-backed store is the natural next step, noted directly in the code.
+-- **Outbound SMS is stubbed in the demo build.** `twilio_service.send_sms` is fully implemented but commented out to avoid sending real texts from a portfolio deployment; re-enabling it requires an upgraded Twilio account (and A2P 10DLC registration for US traffic).
+-- **Dashboard auth is demo-grade.** The `?key=` query-string check is intentionally minimal for a portfolio demo; a production deployment would move to session-based auth (a key in a URL gets logged by servers, proxies, and browser history).
+ - **Latency isn't formally benchmarked yet** (see Performance).
+\ No newline at end of file
+diff --git a/app/main.py b/app/main.py
+index 8500cb4..8003e60 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -14,9 +14,6 @@ from app.db import create_db_and_tables
+ from app.auth import NotAuthenticated
+ from app.rate_limit import limiter
+ from app.routes.voice import router as voice_router
+-from app.routes.sms import router as sms_router
+-from app.routes.leads import router as leads_router
+-from app.routes.calls import router as calls_router
+ from app.routes.dashboard import router as dashboard_router
+ from app.routes.demo import router as demo_router
+ from app.routes.onboarding import router as onboarding_router
+@@ -52,9 +49,6 @@ def health():
+ 
+ 
+ app.include_router(voice_router)
+-app.include_router(sms_router)
+-app.include_router(leads_router)
+-app.include_router(calls_router)
+ app.include_router(dashboard_router)
+ app.include_router(demo_router)
+ app.include_router(onboarding_router)
+diff --git a/app/routes/calls.py b/app/routes/calls.py
+deleted file mode 100644
+index 18631fa..0000000
+--- a/app/routes/calls.py
++++ /dev/null
+@@ -1,217 +0,0 @@
+-import logging
+-from fastapi import APIRouter, Depends, HTTPException
+-from pydantic import BaseModel
+-from sqlmodel import Session, select
+-import json
+-
+-from app.db import get_session
+-from app.models import Business
+-from app.schemas import LeadCreate
+-from app.services.ai_service import analyze_customer_turn
+-from app.services.config_service import (
+-    get_business_config,
+-    get_required_fields,
+-    get_first_missing_required_field,
+-    get_prompt_for_field,
+-)
+-from app.services.lead_service import (
+-    create_lead,
+-    mark_booking_link_sent,
+-    mark_owner_notified,
+-)
+-from app.services.twilio_service import send_sms
+-from app.config import settings
+-
+-logger = logging.getLogger(__name__)
+-
+-router = APIRouter(prefix="/api/calls", tags=["calls"])
+-
+-class CallInitRequest(BaseModel):
+-    to_number: str
+-    from_number: str
+-
+-class CallMergeRequest(BaseModel):
+-    business_id: str
+-    call_state: str
+-    user_message: str
+-
+-class CallCompleteRequest(BaseModel):
+-    business_id: str
+-    call_state: str
+-
+-def parse_json_list(raw: str | None) -> list[str]:
+-    """Helper to parse config fields that are stored as JSON lists."""
+-    if not raw:
+-        return []
+-    try:
+-        data = json.loads(raw)
+-        return data if isinstance(data, list) else []
+-    except Exception:
+-        return []
+-    
+-@router.post("/init")
+-def init_call(payload: CallInitRequest, session: Session = Depends(get_session)):
+-    statement = select(Business).where(Business.twilio_number == payload.to_number)
+-    business = session.exec(statement).first()
+-
+-    if not business:
+-        raise HTTPException(status_code=404, detail="Business not found for this phone number.")
+-
+-    if not business.is_active:
+-        raise HTTPException(status_code=403, detail="This business's service is not currently active.")
+-
+-    config = get_business_config(session, business.id)
+-
+-    greeting = (
+-        config.greeting
+-        if config and config.greeting
+-        else f"Hi, this is {business.name}. Everyone is with clients right now, but I can help. What can I get you today?"
+-    )
+-
+-    completion_message = (
+-        config.completion_message
+-        if config and config.completion_message
+-        else "Perfect, I’ve got everything I need. The business will follow up with you soon."
+-    )
+-
+-    fallback_message = (
+-        config.fallback_message
+-        if config and config.fallback_message
+-        else "Sorry, something went wrong. Please call back in a few minutes."
+-    )
+-
+-    return {
+-        "business_id": business.id,
+-        "business_name": business.name,
+-        "business_type": business.business_type,
+-        "timezone": business.timezone,
+-        "from_number": payload.from_number,
+-        "to_number": payload.to_number,
+-        "greeting": greeting,
+-        "required_fields": get_required_fields(config),
+-        "services": parse_json_list(config.services_json if config else "[]"),
+-        "staff": parse_json_list(config.staff_json if config else "[]"),
+-        "completion_message": completion_message,
+-        "fallback_message": fallback_message,
+-        "initial_state": {
+-            "phone_number": payload.from_number,
+-            "caller_name": None,
+-            "intent": "booking",
+-            "service_requested": None,
+-            "preferred_barber": None,
+-            "preferred_time": None,
+-            "notes": [],
+-},
+-    }
+-
+-def merge_field(old_value, new_value):
+-    return new_value if new_value not in (None, "", "Unknown") else old_value
+-
+-import json
+-
+-@router.post("/merge-state")
+-def merge_state(payload: CallMergeRequest, session: Session = Depends(get_session)):
+-    state = json.loads(payload.call_state)
+-
+-    statement = select(Business).where(Business.id == payload.business_id)
+-    business = session.exec(statement).first()
+-
+-    if not business:
+-        raise HTTPException(status_code=404, detail="Business not found.")
+-
+-    config = get_business_config(session, business.id)
+-
+-    result = analyze_customer_turn(payload.user_message)
+-
+-    state["caller_name"] = merge_field(state.get("caller_name"), result.get("caller_name"))
+-    state["intent"] = merge_field(state.get("intent"), result.get("intent", "booking"))
+-    state["service_requested"] = merge_field(state.get("service_requested"), result.get("service_requested"))
+-    state["preferred_barber"] = merge_field(state.get("preferred_barber"), result.get("preferred_barber"))
+-    state["preferred_time"] = merge_field(state.get("preferred_time"), result.get("preferred_time"))
+-
+-    if payload.user_message:
+-        state["notes"].append(payload.user_message)
+-
+-    missing_field = get_first_missing_required_field(config, state)
+-    next_prompt = get_prompt_for_field(config, missing_field) if missing_field else None
+-
+-    return {
+-        "updated_state": state,
+-        "missing_field": missing_field,
+-        "next_prompt": next_prompt,
+-        "is_complete": missing_field is None,
+-    }
+-    
+-import json
+-
+-@router.post("/complete")
+-def complete_call(payload: CallCompleteRequest, session: Session = Depends(get_session)):
+-    state = json.loads(payload.call_state)
+-
+-    statement = select(Business).where(Business.id == payload.business_id)
+-    business = session.exec(statement).first()
+-
+-    if not business:
+-        raise HTTPException(status_code=404, detail="Business not found.")
+-
+-    config = get_business_config(session, business.id)
+-
+-    combined_notes = " | ".join(state.get("notes", []))
+-
+-    lead = create_lead(
+-        session,
+-        LeadCreate(
+-            business_id=business.id,
+-            phone_number=state.get("phone_number") or "",
+-            caller_name=state.get("caller_name"),
+-            intent=state.get("intent", "booking"),
+-            service_requested=state.get("service_requested"),
+-            preferred_barber=state.get("preferred_barber"),
+-            preferred_time=state.get("preferred_time"),
+-            notes=combined_notes,
+-        ),
+-    )
+-
+-    customer_text = (
+-        f"Hey {lead.caller_name or ''}! We got your request for a "
+-        f"{lead.service_requested or 'service'} "
+-        f"{'at ' + lead.preferred_time if lead.preferred_time else ''}. "
+-        f"Book here to lock it in: {business.booking_link}"
+-    )
+-
+-    owner_text = (
+-        f"📞 New missed call lead\n\n"
+-        f"👤 {lead.caller_name or 'Unknown'}\n"
+-        f"💈 {lead.service_requested or 'Unknown service'}\n"
+-        f"⏰ {lead.preferred_time or 'No time given'}\n"
+-        f"✂️ {lead.preferred_barber or 'No preference'}\n\n"
+-        f"📱 {lead.phone_number}"
+-    )
+-
+-    try:
+-        if config and config.send_customer_sms and business.booking_link and settings.twilio_phone_number:
+-            customer_msg = send_sms(lead.phone_number, customer_text)
+-            logger.info("Customer SMS sent sid=%s", customer_msg.sid)
+-            mark_booking_link_sent(session, lead)
+-    except Exception as e:
+-        logger.error("Customer SMS failed: %s", e)
+-
+-    try:
+-        if config and config.send_owner_sms and business.owner_phone and settings.twilio_phone_number:
+-            owner_msg = send_sms(business.owner_phone, owner_text)
+-            logger.info("Owner SMS sent sid=%s", owner_msg.sid)
+-            mark_owner_notified(session, lead)
+-    except Exception as e:
+-        logger.error("Owner SMS failed: %s", e)
+-
+-    completion_message = (
+-        config.completion_message
+-        if config and config.completion_message
+-        else "Perfect, I’ve got everything I need. The business will follow up with you soon."
+-    )
+-
+-    return {
+-        "success": True,
+-        "lead_id": lead.id,
+-        "completion_message": completion_message,
+-    }
+\ No newline at end of file
+diff --git a/app/routes/demo.py b/app/routes/demo.py
+index 72c761f..8bbc625 100644
+--- a/app/routes/demo.py
++++ b/app/routes/demo.py
+@@ -637,12 +637,15 @@ def _build_demo_html(phone_display: str, phone_tel: str) -> str:
+       return name.trim().split(/\s+/).map(p => p[0]).join('').toUpperCase().slice(0, 2);
+     }}
+ 
+-    function maskPhone(raw) {{
+-      const digits = (raw || '').replace(/\D/g, '');
+-      if (digits.length >= 10) {{
+-        return `+1 (***) ***-${{digits.slice(-4)}}`;
+-      }}
+-      return '(***) ***-****';
++    // Caller-supplied fields (name, service, preferred_time) come from AI
++    // transcription of live phone calls, so they're untrusted text. This
++    // page renders lead cards via innerHTML for a WebSocket feed with no
++    // auth, so every such field must be escaped before interpolation —
++    // never trust that voice-transcribed text can't contain HTML.
++    function escapeHtml(value) {{
++      const div = document.createElement('div');
++      div.textContent = value == null ? '' : String(value);
++      return div.innerHTML;
+     }}
+ 
+     function relativeTime(isoStr) {{
+@@ -663,17 +666,21 @@ def _build_demo_html(phone_display: str, phone_tel: str) -> str:
+       const idx  = hashName(name);
+       const [fg, bg] = AVATAR_COLORS[idx];
+ 
++      // The server already reduces the phone number to its last 4 digits
++      // before it ever reaches this unauthenticated channel — see
++      // _mask_phone() in app/routes/voice.py. Nothing here re-derives or
++      // widens it; this page only displays whatever the server sent.
+       const card = document.createElement('div');
+       card.className = 'lead-card new';
+       card.innerHTML = `
+-        <div class="lead-avatar" style="background:${{bg}};color:${{fg}}">${{initials(name)}}</div>
++        <div class="lead-avatar" style="background:${{bg}};color:${{fg}}">${{escapeHtml(initials(name))}}</div>
+         <div class="lead-body">
+-          <div class="lead-name">${{name}}</div>
++          <div class="lead-name">${{escapeHtml(name)}}</div>
+           <div class="lead-meta">
+-            ${{data.service ? `<span class="service-pill">${{data.service}}</span>` : ''}}
+-            ${{data.preferred_time ? `<span class="lead-time-req">${{data.preferred_time}}</span>` : ''}}
++            ${{data.service ? `<span class="service-pill">${{escapeHtml(data.service)}}</span>` : ''}}
++            ${{data.preferred_time ? `<span class="lead-time-req">${{escapeHtml(data.preferred_time)}}</span>` : ''}}
+           </div>
+-          <div class="lead-phone">${{maskPhone(data.phone)}}</div>
++          <div class="lead-phone">${{escapeHtml(data.phone || '(***) ***-****')}}</div>
+         </div>
+         <div class="lead-ts">${{relativeTime(data.timestamp || new Date().toISOString())}}</div>
+       `;
+diff --git a/app/routes/leads.py b/app/routes/leads.py
+deleted file mode 100644
+index 6cf34c3..0000000
+--- a/app/routes/leads.py
++++ /dev/null
+@@ -1,14 +0,0 @@
+-"""Lead listing endpoints used by frontend or diagnostics."""
+-
+-from fastapi import APIRouter, Depends
+-from sqlmodel import Session
+-from app.db import get_session
+-from app.services.lead_service import list_leads
+-
+-router = APIRouter(prefix="/leads", tags=["leads"])
+-
+-
+-@router.get("/")
+-def get_leads(session: Session = Depends(get_session)):
+-    """Return all captured leads (newest first)."""
+-    return list_leads(session)
+\ No newline at end of file
+diff --git a/app/routes/sms.py b/app/routes/sms.py
+deleted file mode 100644
+index f4ba6b4..0000000
+--- a/app/routes/sms.py
++++ /dev/null
+@@ -1,14 +0,0 @@
+-"""Simple read-only SMS-related endpoints."""
+-
+-from fastapi import APIRouter, Depends
+-from sqlmodel import Session
+-from app.db import get_session
+-from app.services.lead_service import list_leads
+-
+-router = APIRouter(prefix="/sms", tags=["sms"])
+-
+-
+-@router.get("/leads")
+-def get_leads(session: Session = Depends(get_session)):
+-    """Return all captured leads (newest first)."""
+-    return list_leads(session)
+\ No newline at end of file
+diff --git a/app/routes/voice.py b/app/routes/voice.py
+index 2075271..c199c79 100644
+--- a/app/routes/voice.py
++++ b/app/routes/voice.py
+@@ -1,6 +1,7 @@
+ """Voice webhook endpoints that collect lead details over multi-turn calls."""
+ 
+ import logging
++import re
+ from fastapi import APIRouter, Depends, Form, Request, Response
+ from sqlmodel import Session
+ from sqlmodel import select
+@@ -50,6 +51,20 @@ def _display_name(full_name: str | None) -> str:
+     return f"{parts[0]} {parts[-1][0]}."
+ 
+ 
++def _mask_phone(phone: str | None) -> str:
++    """Reduce a phone number to its last 4 digits for the public demo
++    broadcast (/ws/leads has no auth — see app/routes/demo.py). The full
++    number must never reach that channel; masking client-side only isn't
++    enough since the raw value would still be visible in the WebSocket
++    frame to anyone inspecting network traffic on the public /demo page."""
++    if not phone:
++        return "(***) ***-****"
++    digits = re.sub(r"\D", "", phone)
++    if len(digits) >= 4:
++        return f"+1 (***) ***-{digits[-4:]}"
++    return "(***) ***-****"
++
++
+ def gather_response(prompt_text: str, action_path: str) -> str:
+     """Return TwiML that asks for speech and posts the response to action_path.
+ 
+@@ -253,7 +268,7 @@ async def collect_turn(
+         "type": "new_lead",
+         "data": {
+             "name": _display_name(lead.caller_name),
+-            "phone": lead.phone_number or "",
++            "phone": _mask_phone(lead.phone_number),
+             "service": lead.service_requested or "Inquiry",
+             "preferred_time": lead.preferred_time or "",
+             "timestamp": datetime.now(timezone.utc).isoformat(),
+diff --git a/tests/results.md b/tests/results.md
+index 9a44253..0710b20 100644
+--- a/tests/results.md
++++ b/tests/results.md
+@@ -1,8 +1,8 @@
+ # Stress-test results
+ 
+-_Generated by the test suite on 2026-08-28 18:29 — re-run `pytest` to refresh._
++_Generated by the test suite on 2026-08-28 19:00 — re-run `pytest` to refresh._
+ 
+-**Overall: 60/60 scenarios passed.**
++**Overall: 66/66 scenarios passed.**
+ 
+ | Category | Passed | Total |
+ | --- | --- | --- |
+@@ -10,6 +10,6 @@ _Generated by the test suite on 2026-08-28 18:29 — re-run `pytest` to refresh.
+ | Ambiguous bookings | 14 | 14 |
+ | Hostile / off-script callers | 9 | 9 |
+ | Failure injection (OpenAI down / malformed) | 9 | 9 |
+-| Uncategorized | 16 | 16 |
++| Uncategorized | 22 | 22 |
+ 
+ All scenarios passed on the most recent run.
+diff --git a/tests/test_security_review_fixes.py b/tests/test_security_review_fixes.py
+new file mode 100644
+index 0000000..3890f08
+--- /dev/null
++++ b/tests/test_security_review_fixes.py
+@@ -0,0 +1,58 @@
++"""Regression tests for the general code-review fixes:
++
++- /leads/, /sms/leads, and /api/calls/* were unauthenticated duplicate/dead
++  routes (the first two leaked every lead across every business with zero
++  auth) — confirm they're gone entirely, not just now-authenticated.
++- The public /ws/leads broadcast must never carry a full phone number —
++  confirm the server-side masking helper actually strips it before it would
++  reach that channel.
++"""
++
++import pytest
++from fastapi.testclient import TestClient
++
++from app.main import app
++from app.routes.voice import _mask_phone
++
++
++@pytest.fixture
++def client():
++    return TestClient(app)
++
++
++def test_leads_route_is_gone(client):
++    resp = client.get("/leads/")
++    assert resp.status_code == 404
++
++
++def test_sms_leads_route_is_gone(client):
++    resp = client.get("/sms/leads")
++    assert resp.status_code == 404
++
++
++def test_api_calls_routes_are_gone(client):
++    assert client.post("/api/calls/init", json={}).status_code == 404
++    assert client.post("/api/calls/merge-state", json={}).status_code == 404
++    assert client.post("/api/calls/complete", json={}).status_code == 404
++
++
++def test_mask_phone_keeps_only_last_four_digits():
++    assert _mask_phone("+15550001234") == "+1 (***) ***-1234"
++    assert _mask_phone("5550001234") == "+1 (***) ***-1234"
++
++
++def test_mask_phone_handles_missing_or_short_input():
++    assert _mask_phone(None) == "(***) ***-****"
++    assert _mask_phone("") == "(***) ***-****"
++    assert _mask_phone("12") == "(***) ***-****"
++
++
++def test_mask_phone_never_returns_more_than_last_four_digits_of_input():
++    """However phone numbers get formatted upstream, no more than 4 raw
++    digits from the actual number should ever be recoverable from the
++    masked output (the leading '+1' is a fixed literal, not derived from
++    the input, so it's excluded from this check)."""
++    masked = _mask_phone("+1 (555) 000-1234")
++    visible_digits = masked.rsplit("-", 1)[-1]
++    assert visible_digits == "1234"
++    assert masked.count("*") >= 6
