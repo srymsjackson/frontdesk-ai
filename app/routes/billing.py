@@ -17,6 +17,7 @@ from app.db import get_session
 from app.models import Business
 from app.config import settings
 from app.rate_limit import limiter
+from app.billing_tokens import verify_checkout_token
 from app.services.stripe_service import create_checkout_session, construct_webhook_event
 
 logger = logging.getLogger(__name__)
@@ -53,17 +54,32 @@ def simple_page(title: str, message: str) -> str:
 @limiter.limit("10/minute")
 def start_checkout(
     request: Request,
-    business_id: int = Query(...),
-    plan: str = Query(...),
+    token: str = Query(..., description="Signed token from /onboarding, binds one business_id to one plan"),
     session: Session = Depends(get_session),
 ):
-    """Redirect to a Stripe Checkout page for the given business + plan."""
+    """Redirect to a Stripe Checkout page for the business + plan bound to `token`.
+
+    Takes a signed token (see app/billing_tokens.py) rather than raw
+    business_id/plan query params -- those were directly editable in the URL
+    bar, so a link handed to one business could be altered to activate a
+    different business_id, or to pay for a different plan than the one
+    actually offered. A tampered or expired token fails validation the same
+    way a garbage one does: one generic error, not "invalid" vs "not found",
+    so a bad guess doesn't confirm anything about what does exist.
+    """
+    decoded = verify_checkout_token(token)
+    if decoded is None:
+        raise HTTPException(status_code=400, detail="This checkout link is invalid or has expired.")
+    business_id, plan = decoded
+
     if plan not in VALID_PLANS:
+        # Defense-in-depth: tokens are only ever minted by /onboarding with a
+        # hardcoded plan value, so this shouldn't be reachable in practice.
         raise HTTPException(status_code=400, detail=f"Unknown plan '{plan}'. Valid plans: {sorted(VALID_PLANS)}")
 
     business = session.get(Business, business_id)
     if not business:
-        raise HTTPException(status_code=404, detail="Business not found")
+        raise HTTPException(status_code=400, detail="This checkout link is invalid or has expired.")
 
     base = settings.base_url.rstrip("/")
     try:

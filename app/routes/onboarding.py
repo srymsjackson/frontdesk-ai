@@ -18,6 +18,7 @@ from app.models import Business, BusinessConfig
 from app.auth import require_dashboard_auth
 from app.rate_limit import limiter
 from app.config import settings
+from app.billing_tokens import create_checkout_token
 
 logger = logging.getLogger(__name__)
 
@@ -261,8 +262,10 @@ def create_business(
     logger.info("Onboarded new business id=%s name=%s", business.id, business.name)
 
     base = settings.base_url.rstrip("/")
-    basic_link = f"{base}/billing/checkout?business_id={business.id}&plan=basic"
-    pro_link = f"{base}/billing/checkout?business_id={business.id}&plan=pro"
+    basic_token = create_checkout_token(business_id=business.id, plan="basic")
+    pro_token = create_checkout_token(business_id=business.id, plan="pro")
+    basic_link = f"{base}/billing/checkout?token={basic_token}"
+    pro_link = f"{base}/billing/checkout?token={pro_token}"
 
     success_html = (
         f"Created '{esc(business.name)}' (business id={business.id}), currently <b>inactive</b> until they pay. "

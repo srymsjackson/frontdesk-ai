@@ -92,6 +92,10 @@ def test_billing_checkout_rate_limited_after_10_per_minute(client, monkeypatch):
     # Avoid a real network call to Stripe — we're only testing the rate
     # limiter here, not checkout session creation itself.
     import app.routes.billing as billing_module
+    from app.billing_tokens import create_checkout_token
+    from app.models import Business
+    from app.db import engine
+    from sqlmodel import Session as DBSession
 
     def fake_create_checkout_session(**kwargs):
         class FakeSession:
@@ -100,9 +104,18 @@ def test_billing_checkout_rate_limited_after_10_per_minute(client, monkeypatch):
 
     monkeypatch.setattr(billing_module, "create_checkout_session", fake_create_checkout_session)
 
+    with DBSession(engine) as db:
+        business = Business(name="Rate Limit Test Co", twilio_number="+15555559999", owner_phone="+15555550000")
+        db.add(business)
+        db.commit()
+        db.refresh(business)
+        business_id = business.id
+
+    token = create_checkout_token(business_id=business_id, plan="basic")
+
     statuses = []
     for _ in range(13):
-        resp = client.get("/billing/checkout?business_id=1&plan=basic", follow_redirects=False)
+        resp = client.get(f"/billing/checkout?token={token}", follow_redirects=False)
         statuses.append(resp.status_code)
 
     assert all(s != 429 for s in statuses[:10]), statuses[:10]
