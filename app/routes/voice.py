@@ -114,6 +114,13 @@ async def incoming_call(
         response.hangup()
         return Response(content=str(response), media_type="application/xml")
 
+    if not business.is_active:
+        logger.warning("Call to inactive business id=%s name=%s", business.id, business.name)
+        response = VoiceResponse()
+        response.say("Sorry, this line is temporarily unavailable. Please try again later.")
+        response.hangup()
+        return Response(content=str(response), media_type="application/xml")
+
     config = get_business_config(session, business.id)
 
     normalized_from = normalize_number(From)

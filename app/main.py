@@ -14,6 +14,7 @@ from app.routes.calls import router as calls_router
 from app.routes.dashboard import router as dashboard_router
 from app.routes.demo import router as demo_router
 from app.routes.onboarding import router as onboarding_router
+from app.routes.billing import router as billing_router
 
 app = FastAPI(title=settings.app_name)
 
@@ -37,3 +38,4 @@ app.include_router(calls_router)
 app.include_router(dashboard_router)
 app.include_router(demo_router)
 app.include_router(onboarding_router)
+app.include_router(billing_router)

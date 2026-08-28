@@ -15,6 +15,7 @@ from sqlmodel import Session, select
 from app.db import get_session
 from app.models import Business, BusinessConfig
 from app.routes.dashboard import DASHBOARD_KEY, check_key
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +30,12 @@ def esc(value):
 
 
 def render_form(key: str, error: str | None = None, success: str | None = None) -> str:
-    """Render the intake form. `key` is threaded through so the POST stays authorized."""
+    """Render the intake form. `key` is threaded through so the POST stays authorized.
+
+    `success` is trusted HTML (built server-side, not from user input) so links render;
+    `error` is always escaped since it can echo back user-typed values."""
     error_html = f'<div class="banner error">{esc(error)}</div>' if error else ""
-    success_html = f'<div class="banner success">{esc(success)}</div>' if success else ""
+    success_html = f'<div class="banner success">{success}</div>' if success else ""
 
     return f"""
     <!DOCTYPE html>
@@ -224,6 +228,7 @@ def create_business(
         booking_link=booking_link.strip() or None,
         business_type=business_type.strip() or None,
         timezone=timezone.strip() or "UTC",
+        is_active=False,  # goes live once Stripe checkout completes (see /billing/webhook)
     )
     session.add(business)
     session.commit()
@@ -254,9 +259,16 @@ def create_business(
 
     logger.info("Onboarded new business id=%s name=%s", business.id, business.name)
 
-    return HTMLResponse(
-        content=render_form(
-            key,
-            success=f"Created '{business.name}' (business id={business.id}). Point its Twilio number's voice webhook at your /voice/incoming endpoint to go live.",
-        )
+    base = settings.base_url.rstrip("/")
+    basic_link = f"{base}/billing/checkout?business_id={business.id}&plan=basic"
+    pro_link = f"{base}/billing/checkout?business_id={business.id}&plan=pro"
+
+    success_html = (
+        f"Created '{esc(business.name)}' (business id={business.id}), currently <b>inactive</b> until they pay. "
+        f"Send them one of these checkout links &mdash; the business auto-activates when payment completes:<br><br>"
+        f"Basic: <a href=\"{basic_link}\">{basic_link}</a><br>"
+        f"Pro: <a href=\"{pro_link}\">{pro_link}</a><br><br>"
+        f"Also point their Twilio number's voice webhook at your /voice/incoming endpoint."
     )
+
+    return HTMLResponse(content=render_form(key, success=success_html))

@@ -22,6 +22,13 @@ class Business(SQLModel, table=True):
 
     is_active: bool = True
 
+    # Stripe subscription tracking. plan is a slug like "basic" or "pro" (see
+    # settings.stripe_price_basic / stripe_price_pro for the price IDs those map to).
+    plan: Optional[str] = None
+    stripe_customer_id: Optional[str] = None
+    stripe_subscription_id: Optional[str] = None
+    subscription_status: Optional[str] = None  # mirrors Stripe's status string, e.g. "active", "canceled", "past_due"
+
 
 class Lead(SQLModel, table=True):
     """A single inbound caller request captured by the receptionist flow."""

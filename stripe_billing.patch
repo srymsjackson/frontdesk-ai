@@ -1,0 +1,387 @@
+diff --git a/app/config.py b/app/config.py
+index 1b44f68..e495be6 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -34,5 +34,11 @@ class Settings(BaseModel):
+     elevenlabs_voice_id: str = os.getenv("ELEVENLABS_VOICE_ID", "")
+     elevenlabs_model: str = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
+ 
++    stripe_secret_key: str = os.getenv("STRIPE_SECRET_KEY", "")
++    stripe_webhook_secret: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
++    # Stripe Price IDs (price_xxx) for each plan tier, created in the Stripe dashboard.
++    stripe_price_basic: str = os.getenv("STRIPE_PRICE_BASIC", "")
++    stripe_price_pro: str = os.getenv("STRIPE_PRICE_PRO", "")
++
+ 
+ settings = Settings()
+\ No newline at end of file
+diff --git a/app/main.py b/app/main.py
+index 0e9b109..3017563 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -14,6 +14,7 @@ from app.routes.calls import router as calls_router
+ from app.routes.dashboard import router as dashboard_router
+ from app.routes.demo import router as demo_router
+ from app.routes.onboarding import router as onboarding_router
++from app.routes.billing import router as billing_router
+ 
+ app = FastAPI(title=settings.app_name)
+ 
+@@ -36,4 +37,5 @@ app.include_router(leads_router)
+ app.include_router(calls_router)
+ app.include_router(dashboard_router)
+ app.include_router(demo_router)
+-app.include_router(onboarding_router)
+\ No newline at end of file
++app.include_router(onboarding_router)
++app.include_router(billing_router)
+\ No newline at end of file
+diff --git a/app/models.py b/app/models.py
+index 394a526..d5d7e28 100644
+--- a/app/models.py
++++ b/app/models.py
+@@ -22,6 +22,13 @@ class Business(SQLModel, table=True):
+ 
+     is_active: bool = True
+ 
++    # Stripe subscription tracking. plan is a slug like "basic" or "pro" (see
++    # settings.stripe_price_basic / stripe_price_pro for the price IDs those map to).
++    plan: Optional[str] = None
++    stripe_customer_id: Optional[str] = None
++    stripe_subscription_id: Optional[str] = None
++    subscription_status: Optional[str] = None  # mirrors Stripe's status string, e.g. "active", "canceled", "past_due"
++
+ 
+ class Lead(SQLModel, table=True):
+     """A single inbound caller request captured by the receptionist flow."""
+diff --git a/app/routes/billing.py b/app/routes/billing.py
+new file mode 100644
+index 0000000..86c5868
+--- /dev/null
++++ b/app/routes/billing.py
+@@ -0,0 +1,155 @@
++"""Stripe checkout + webhook endpoints.
++
++/billing/checkout   - GET, redirects the browser to a Stripe-hosted Checkout page
++                       for a given business_id + plan.
++/billing/success     - GET, plain confirmation page Stripe redirects back to.
++/billing/cancel       - GET, plain "you didn't complete checkout" page.
++/billing/webhook     - POST, Stripe calls this on subscription lifecycle events.
++"""
++
++import logging
++from fastapi import APIRouter, Depends, HTTPException, Query, Request
++from fastapi.responses import HTMLResponse, RedirectResponse
++from sqlmodel import Session, select
++import stripe
++
++from app.db import get_session
++from app.models import Business
++from app.config import settings
++from app.services.stripe_service import create_checkout_session, construct_webhook_event
++
++logger = logging.getLogger(__name__)
++
++router = APIRouter(prefix="/billing", tags=["billing"])
++
++VALID_PLANS = {"basic", "pro"}
++
++
++def simple_page(title: str, message: str) -> str:
++    """Minimal styled HTML page, matching the look of the other plain-HTML routes."""
++    return f"""
++    <!DOCTYPE html>
++    <html>
++    <head>
++        <meta charset="utf-8">
++        <title>{title}</title>
++        <style>
++            body {{ font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 60px 24px;
++                    text-align: center; color: #222; }}
++            h1 {{ font-size: 22px; }}
++            p {{ color: #666; }}
++        </style>
++    </head>
++    <body>
++        <h1>{title}</h1>
++        <p>{message}</p>
++    </body>
++    </html>
++    """
++
++
++@router.get("/checkout")
++def start_checkout(
++    business_id: int = Query(...),
++    plan: str = Query(...),
++    session: Session = Depends(get_session),
++):
++    """Redirect to a Stripe Checkout page for the given business + plan."""
++    if plan not in VALID_PLANS:
++        raise HTTPException(status_code=400, detail=f"Unknown plan '{plan}'. Valid plans: {sorted(VALID_PLANS)}")
++
++    business = session.get(Business, business_id)
++    if not business:
++        raise HTTPException(status_code=404, detail="Business not found")
++
++    base = settings.base_url.rstrip("/")
++    try:
++        checkout_session = create_checkout_session(
++            business_id=business_id,
++            plan=plan,
++            success_url=f"{base}/billing/success?business_id={business_id}",
++            cancel_url=f"{base}/billing/cancel?business_id={business_id}",
++        )
++    except ValueError as e:
++        raise HTTPException(status_code=500, detail=str(e))
++    except stripe.error.StripeError as e:
++        logger.error("Stripe API error creating checkout session for business_id=%s: %s", business_id, e)
++        raise HTTPException(status_code=502, detail="Could not reach Stripe. Please try again shortly.")
++
++    return RedirectResponse(url=checkout_session.url, status_code=303)
++
++
++@router.get("/success", response_class=HTMLResponse)
++def checkout_success(business_id: int = Query(...)):
++    """Landing page after a successful Stripe Checkout. is_active flips via webhook,
++    not here — Stripe's redirect can fire before the webhook lands, so this page
++    never trusts query params to grant access."""
++    return HTMLResponse(content=simple_page(
++        "You're all set!",
++        "Thanks for subscribing. Your line will be activated within a minute or two once we confirm payment.",
++    ))
++
++
++@router.get("/cancel", response_class=HTMLResponse)
++def checkout_cancel(business_id: int = Query(...)):
++    return HTMLResponse(content=simple_page(
++        "Checkout canceled",
++        "No charge was made. Reach out any time if you'd like to try again.",
++    ))
++
++
++@router.post("/webhook")
++async def stripe_webhook(request: Request, session: Session = Depends(get_session)):
++    """Handle Stripe subscription lifecycle events and keep Business rows in sync."""
++    payload = await request.body()
++    sig_header = request.headers.get("stripe-signature", "")
++
++    try:
++        event = construct_webhook_event(payload, sig_header)
++    except (ValueError, stripe.error.SignatureVerificationError) as e:
++        logger.warning("Rejected Stripe webhook: %s", e)
++        raise HTTPException(status_code=400, detail="Invalid signature")
++
++    event_type = event["type"]
++    data = event["data"]["object"]
++    logger.info("Stripe webhook received: %s", event_type)
++
++    def _business_from(obj) -> Business | None:
++        """Pull business_id out of metadata and look up the row."""
++        business_id = (obj.get("metadata") or {}).get("business_id") or obj.get("client_reference_id")
++        if not business_id:
++            logger.warning("Stripe event %s missing business_id metadata", event_type)
++            return None
++        return session.get(Business, int(business_id))
++
++    if event_type == "checkout.session.completed":
++        business = _business_from(data)
++        if business:
++            business.stripe_customer_id = data.get("customer")
++            business.stripe_subscription_id = data.get("subscription")
++            business.plan = (data.get("metadata") or {}).get("plan") or business.plan
++            business.is_active = True
++            business.subscription_status = "active"
++            session.add(business)
++            session.commit()
++            logger.info("Activated business id=%s via checkout.session.completed", business.id)
++
++    elif event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
++        sub_id = data.get("id")
++        business = session.exec(
++            select(Business).where(Business.stripe_subscription_id == sub_id)
++        ).first()
++        if business:
++            status = data.get("status")  # active, past_due, canceled, unpaid, etc.
++            business.subscription_status = status
++            business.is_active = status == "active"
++            session.add(business)
++            session.commit()
++            logger.info("Updated business id=%s subscription_status=%s is_active=%s", business.id, status, business.is_active)
++        else:
++            logger.warning("No business found for Stripe subscription id=%s", sub_id)
++
++    else:
++        logger.debug("Ignoring unhandled Stripe event type: %s", event_type)
++
++    return {"received": True}
+diff --git a/app/routes/calls.py b/app/routes/calls.py
+index 9d7fe7b..18631fa 100644
+--- a/app/routes/calls.py
++++ b/app/routes/calls.py
+@@ -57,6 +57,9 @@ def init_call(payload: CallInitRequest, session: Session = Depends(get_session))
+     if not business:
+         raise HTTPException(status_code=404, detail="Business not found for this phone number.")
+ 
++    if not business.is_active:
++        raise HTTPException(status_code=403, detail="This business's service is not currently active.")
++
+     config = get_business_config(session, business.id)
+ 
+     greeting = (
+diff --git a/app/routes/onboarding.py b/app/routes/onboarding.py
+index 25e49bc..90cde62 100644
+--- a/app/routes/onboarding.py
++++ b/app/routes/onboarding.py
+@@ -15,6 +15,7 @@ from sqlmodel import Session, select
+ from app.db import get_session
+ from app.models import Business, BusinessConfig
+ from app.routes.dashboard import DASHBOARD_KEY, check_key
++from app.config import settings
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -29,9 +30,12 @@ def esc(value):
+ 
+ 
+ def render_form(key: str, error: str | None = None, success: str | None = None) -> str:
+-    """Render the intake form. `key` is threaded through so the POST stays authorized."""
++    """Render the intake form. `key` is threaded through so the POST stays authorized.
++
++    `success` is trusted HTML (built server-side, not from user input) so links render;
++    `error` is always escaped since it can echo back user-typed values."""
+     error_html = f'<div class="banner error">{esc(error)}</div>' if error else ""
+-    success_html = f'<div class="banner success">{esc(success)}</div>' if success else ""
++    success_html = f'<div class="banner success">{success}</div>' if success else ""
+ 
+     return f"""
+     <!DOCTYPE html>
+@@ -224,6 +228,7 @@ def create_business(
+         booking_link=booking_link.strip() or None,
+         business_type=business_type.strip() or None,
+         timezone=timezone.strip() or "UTC",
++        is_active=False,  # goes live once Stripe checkout completes (see /billing/webhook)
+     )
+     session.add(business)
+     session.commit()
+@@ -254,9 +259,16 @@ def create_business(
+ 
+     logger.info("Onboarded new business id=%s name=%s", business.id, business.name)
+ 
+-    return HTMLResponse(
+-        content=render_form(
+-            key,
+-            success=f"Created '{business.name}' (business id={business.id}). Point its Twilio number's voice webhook at your /voice/incoming endpoint to go live.",
+-        )
++    base = settings.base_url.rstrip("/")
++    basic_link = f"{base}/billing/checkout?business_id={business.id}&plan=basic"
++    pro_link = f"{base}/billing/checkout?business_id={business.id}&plan=pro"
++
++    success_html = (
++        f"Created '{esc(business.name)}' (business id={business.id}), currently <b>inactive</b> until they pay. "
++        f"Send them one of these checkout links &mdash; the business auto-activates when payment completes:<br><br>"
++        f"Basic: <a href=\"{basic_link}\">{basic_link}</a><br>"
++        f"Pro: <a href=\"{pro_link}\">{pro_link}</a><br><br>"
++        f"Also point their Twilio number's voice webhook at your /voice/incoming endpoint."
+     )
++
++    return HTMLResponse(content=render_form(key, success=success_html))
+diff --git a/app/routes/voice.py b/app/routes/voice.py
+index 7077c7c..baf36e9 100644
+--- a/app/routes/voice.py
++++ b/app/routes/voice.py
+@@ -114,6 +114,13 @@ async def incoming_call(
+         response.hangup()
+         return Response(content=str(response), media_type="application/xml")
+ 
++    if not business.is_active:
++        logger.warning("Call to inactive business id=%s name=%s", business.id, business.name)
++        response = VoiceResponse()
++        response.say("Sorry, this line is temporarily unavailable. Please try again later.")
++        response.hangup()
++        return Response(content=str(response), media_type="application/xml")
++
+     config = get_business_config(session, business.id)
+ 
+     normalized_from = normalize_number(From)
+diff --git a/app/services/stripe_service.py b/app/services/stripe_service.py
+new file mode 100644
+index 0000000..33afad6
+--- /dev/null
++++ b/app/services/stripe_service.py
+@@ -0,0 +1,57 @@
++"""Stripe subscription checkout + webhook verification helpers.
++
++Flow:
++  1. Onboarding creates a Business with is_active=False (not paid yet).
++  2. Owner is sent a /billing/checkout link for their chosen plan.
++  3. They pay via Stripe's hosted Checkout page.
++  4. Stripe calls our webhook -> we flip Business.is_active = True and store
++     the Stripe customer/subscription ids so future events (cancellation,
++     failed payment) can flip it back off.
++"""
++
++import logging
++import stripe
++from app.config import settings
++
++logger = logging.getLogger(__name__)
++
++stripe.api_key = settings.stripe_secret_key
++
++PLAN_PRICE_IDS = {
++    "basic": settings.stripe_price_basic,
++    "pro": settings.stripe_price_pro,
++}
++
++
++def price_id_for_plan(plan: str) -> str | None:
++    """Look up the Stripe Price ID for a plan slug, or None if unknown/unconfigured."""
++    return PLAN_PRICE_IDS.get(plan) or None
++
++
++def create_checkout_session(business_id: int, plan: str, success_url: str, cancel_url: str):
++    """Create a Stripe Checkout session for a business's subscription.
++
++    Stashes business_id and plan in metadata (and client_reference_id) so the
++    webhook handler can map the completed session back to our Business row
++    without relying on email matching.
++    """
++    price_id = price_id_for_plan(plan)
++    if not price_id:
++        raise ValueError(f"No Stripe price configured for plan '{plan}'")
++
++    session = stripe.checkout.Session.create(
++        mode="subscription",
++        line_items=[{"price": price_id, "quantity": 1}],
++        success_url=success_url,
++        cancel_url=cancel_url,
++        client_reference_id=str(business_id),
++        metadata={"business_id": str(business_id), "plan": plan},
++        subscription_data={"metadata": {"business_id": str(business_id), "plan": plan}},
++    )
++    logger.info("Created Stripe checkout session id=%s business_id=%s plan=%s", session.id, business_id, plan)
++    return session
++
++
++def construct_webhook_event(payload: bytes, sig_header: str):
++    """Verify and parse an incoming Stripe webhook payload. Raises on bad signature."""
++    return stripe.Webhook.construct_event(payload, sig_header, settings.stripe_webhook_secret)
+diff --git a/requirements.txt b/requirements.txt
+index b5273624259b2fc05902aed024e32a9130134d19..a63f44183a4efc5e8aeb035cf7f18cd53e67cd9c 100644
+GIT binary patch
+delta 280
+zcmXBPy-EW?6b0Zre_IR+Y9W$LmStRm1PQZo4Jov@u@egmA)tjRqC^W#A(mp5;WQ$a
+zmU)EW16cV0;yaiJ5N}p4oCBx$;Jz+@FHJ%`YQ;_#AAEdk*DdvFNOyEWm$c7UQk#nZ
+zj6V&mh$ecX#8A}mBr;5e!v}A3;ju1r?8ywLas#*AFVf>(y23Jc#%R9+cPg+)mIl1v
+z&^e8&JyiQHXTYl3L|3IaRvu#&Fy;PK+xS%uPPcHN1IF6nS$oWMiZ9)SHXd6hZ&<o!
+rb;R}++lv<pTBzMhJ~VX<jKibpU}j3pO^UT7Lz(0_Nj&b8nzZx>>OVto
+
+delta 366
+zcmXX?J4!=Q6g>AA!FU%C!sGFfkV0a9C`w3SC0JP~L97C4(nL^$yd~Hvw+JC_!Ubdj
+zS%HP1ShxtWapoYGHyqxbnKN@gc3$FB$HeEW0?^(Al)Hdc8?edpDBCiYdz@RjlOaw|
+z4rO1u_&O4kF-;Rw(;NV=O&vHlg{mepg@U>p)lqT$uX<J0o57~^V;aEBVt*Ri8t_u*
+zx#jJ`W;JG*%0y;J!UTQYe}wHDn}PGK%q^E=ZaAt=T^IPE^U}36&$*OxCL_5}kDhwa
+zi7mbyil?flYT)TP^7JV^Jr|xG*ZSwvGi?#rbP$vo`j{UBUtk@`e-G^P8_3Kn^f{^2
+HJzM+%KUzd;
+

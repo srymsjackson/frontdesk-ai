@@ -57,6 +57,9 @@ def init_call(payload: CallInitRequest, session: Session = Depends(get_session))
     if not business:
         raise HTTPException(status_code=404, detail="Business not found for this phone number.")
 
+    if not business.is_active:
+        raise HTTPException(status_code=403, detail="This business's service is not currently active.")
+
     config = get_business_config(session, business.id)
 
     greeting = (

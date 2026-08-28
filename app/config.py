@@ -34,5 +34,11 @@ class Settings(BaseModel):
     elevenlabs_voice_id: str = os.getenv("ELEVENLABS_VOICE_ID", "")
     elevenlabs_model: str = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
 
+    stripe_secret_key: str = os.getenv("STRIPE_SECRET_KEY", "")
+    stripe_webhook_secret: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+    # Stripe Price IDs (price_xxx) for each plan tier, created in the Stripe dashboard.
+    stripe_price_basic: str = os.getenv("STRIPE_PRICE_BASIC", "")
+    stripe_price_pro: str = os.getenv("STRIPE_PRICE_PRO", "")
+
 
 settings = Settings()
