@@ -1,0 +1,282 @@
+diff --git a/app/routes/voice.py b/app/routes/voice.py
+index c199c79..cdd7498 100644
+--- a/app/routes/voice.py
++++ b/app/routes/voice.py
+@@ -9,7 +9,7 @@ from app.models import Business
+ from app.db import get_session
+ from app.schemas import LeadCreate
+ from app.services.lead_service import create_lead, mark_booking_link_sent, mark_owner_notified
+-from app.services.ai_service import analyze_customer_turn
++from app.services.ai_service import analyze_customer_turn, REQUIRED_FIELDS
+ from app.services.config_service import (
+     get_business_config,
+     get_first_missing_required_field,
+@@ -228,9 +228,10 @@ async def collect_turn(
+ 
+     # Simple inline required-field check — just needs to be non-empty.
+     # Intentionally does NOT do format validation; "tomorrow", "Saturday",
+-    # "asap" are all valid enough to save.
+-    REQUIRED = ["caller_name", "service_requested", "preferred_time"]
+-    first_missing = next((f for f in REQUIRED if not state.get(f)), None)
++    # "asap" are all valid enough to save. REQUIRED_FIELDS lives in
++    # ai_service.py (imported, not re-declared here) so there's one place
++    # that defines what "complete" means for a call.
++    first_missing = next((f for f in REQUIRED_FIELDS if not state.get(f)), None)
+ 
+     if not result.get("enough_to_complete") or first_missing:
+         if first_missing:
+diff --git a/app/services/ai_service.py b/app/services/ai_service.py
+index 70ea742..89eb407 100644
+--- a/app/services/ai_service.py
++++ b/app/services/ai_service.py
+@@ -93,6 +93,31 @@ def fallback_response():
+     }
+ 
+ 
++# The fields voice.py's /voice/collect route requires before it will
++# complete a call — same three the system prompt above tells the model are
++# required. Defined once here so voice.py imports this instead of keeping
++# its own separately-maintained copy that could drift out of sync.
++REQUIRED_FIELDS = ("caller_name", "service_requested", "preferred_time")
++
++
++def _merge_for_completion_check(current_state: dict, data: dict) -> dict:
++    """Preview what state will look like after voice.py's own merge_field
++    step runs moments later, using the same "ignore empty/placeholder
++    values" rule it uses. This lets a fallback path (AI unreachable or
++    returned garbage) judge completion from what's actually been collected
++    across the whole call, not just this one turn."""
++    merged = dict(current_state)
++    for field in REQUIRED_FIELDS:
++        new_value = data.get(field)
++        if new_value not in (None, "", "Unknown"):
++            merged[field] = new_value
++    return merged
++
++
++def _fields_complete(merged_state: dict) -> bool:
++    return all(merged_state.get(field) for field in REQUIRED_FIELDS)
++
++
+ def clean_service(service):
+     if not service:
+         return None
+@@ -233,10 +258,12 @@ def analyze_customer_turn(user_text: str, state: dict | None = None) -> dict:
+         logger.debug("Raw AI response: %s", raw_text)
+ 
+         data = extract_json(raw_text)
++        used_fallback = False
+         if not data:
+             logger.warning("JSON parse failed for AI response: %s", raw_text)
+             data = fallback_response()
+             data["assistant_reply"] = raw_text or data["assistant_reply"]
++            used_fallback = True
+ 
+         data["intent"] = data.get("intent", "booking")
+         data["assistant_reply"] = data.get("assistant_reply", "Got you — what day and time were you thinking?")
+@@ -244,7 +271,19 @@ def analyze_customer_turn(user_text: str, state: dict | None = None) -> dict:
+         data["service_requested"] = clean_service(data.get("service_requested")) or fallback_extract_service(user_text)
+         data["preferred_barber"] = clean_barber(data.get("preferred_barber")) or fallback_extract_barber(user_text)
+         data["preferred_time"] = clean_time(data.get("preferred_time")) or fallback_extract_time(user_text)
+-        data["enough_to_complete"] = bool(data.get("enough_to_complete", False))
++
++        if used_fallback:
++            # The model didn't give us a trustworthy enough_to_complete (it
++            # returned unparseable text), so derive it from what's actually
++            # been collected instead of trusting fallback_response()'s
++            # hardcoded False — otherwise a call that already has every
++            # required field can never complete just because this one turn's
++            # response happened to be garbage.
++            data["enough_to_complete"] = _fields_complete(
++                _merge_for_completion_check(current_state, data)
++            )
++        else:
++            data["enough_to_complete"] = bool(data.get("enough_to_complete", False))
+ 
+         logger.debug("Cleaned data: %s", data)
+         return data
+@@ -256,4 +295,10 @@ def analyze_customer_turn(user_text: str, state: dict | None = None) -> dict:
+         data["service_requested"] = fallback_extract_service(user_text)
+         data["preferred_barber"] = fallback_extract_barber(user_text)
+         data["preferred_time"] = fallback_extract_time(user_text)
++        # Same reasoning as above: OpenAI being unreachable must not mean a
++        # call can never finish once the caller has actually given every
++        # required field over the course of the call.
++        data["enough_to_complete"] = _fields_complete(
++            _merge_for_completion_check(current_state, data)
++        )
+         return data
+\ No newline at end of file
+diff --git a/tests/results.md b/tests/results.md
+index 0710b20..e27a8b7 100644
+--- a/tests/results.md
++++ b/tests/results.md
+@@ -1,8 +1,8 @@
+ # Stress-test results
+ 
+-_Generated by the test suite on 2026-08-28 19:00 — re-run `pytest` to refresh._
++_Generated by the test suite on 2026-08-28 19:11 — re-run `pytest` to refresh._
+ 
+-**Overall: 66/66 scenarios passed.**
++**Overall: 71/71 scenarios passed.**
+ 
+ | Category | Passed | Total |
+ | --- | --- | --- |
+@@ -10,6 +10,6 @@ _Generated by the test suite on 2026-08-28 19:00 — re-run `pytest` to refresh.
+ | Ambiguous bookings | 14 | 14 |
+ | Hostile / off-script callers | 9 | 9 |
+ | Failure injection (OpenAI down / malformed) | 9 | 9 |
+-| Uncategorized | 22 | 22 |
++| Uncategorized | 27 | 27 |
+ 
+ All scenarios passed on the most recent run.
+diff --git a/tests/test_completion_bug_fix.py b/tests/test_completion_bug_fix.py
+new file mode 100644
+index 0000000..991d285
+--- /dev/null
++++ b/tests/test_completion_bug_fix.py
+@@ -0,0 +1,144 @@
++"""Tests for the "call can never complete when OpenAI is down" bug.
++
++Found by manually running the live server and driving a real call through
++/voice/incoming + /voice/collect while OpenAI was unreachable: even after
++all three required fields (caller_name, service_requested, preferred_time)
++were captured via the regex fallback extractors, the call kept asking
++questions forever, because analyze_customer_turn()'s fallback paths
++hardcoded enough_to_complete=False regardless of what had actually been
++collected.
++
++Two levels of coverage:
++  - Unit-level, directly against analyze_customer_turn (patch_ai fixture).
++  - Integration-level, driving the real /voice/incoming + /voice/collect
++    routes with OpenAI failing on every turn, asserting a Lead row actually
++    gets created — the same observable outcome I checked for manually.
++"""
++
++import pytest
++from fastapi.testclient import TestClient
++from sqlmodel import Session, select
++from twilio.request_validator import RequestValidator
++
++from app.services import ai_service
++from app.main import app
++from app.config import settings
++from app.db import engine
++from app.models import Business, Lead
++from sqlmodel import SQLModel
++
++
++# --- unit-level: analyze_customer_turn in isolation -------------------------
++
++def test_enough_to_complete_true_once_all_fields_known_despite_openai_exception(patch_ai):
++    patch_ai(raises=RuntimeError("connection reset"))
++    state = {"caller_name": "Marcus", "service_requested": "fade", "preferred_time": None}
++    result = ai_service.analyze_customer_turn("Thursday at 2pm works", state)
++    assert result["enough_to_complete"] is True
++
++
++def test_enough_to_complete_false_when_a_field_still_missing_after_exception(patch_ai):
++    patch_ai(raises=RuntimeError("connection reset"))
++    state = {"caller_name": "Marcus", "service_requested": None, "preferred_time": None}
++    result = ai_service.analyze_customer_turn("uh hello?", state)
++    assert result["enough_to_complete"] is False
++
++
++def test_enough_to_complete_true_once_all_fields_known_despite_malformed_json(patch_ai):
++    patch_ai(returns="I can help you with that, sure thing")
++    state = {"caller_name": "Priya", "service_requested": "beard trim", "preferred_time": None}
++    result = ai_service.analyze_customer_turn("Thursday at 2pm", state)
++    assert result["enough_to_complete"] is True
++
++
++def test_enough_to_complete_still_trusts_ai_when_ai_succeeds(patch_ai):
++    """A successful, valid-JSON AI response is unaffected by this fix — its
++    own enough_to_complete value is still used as-is, even if it disagrees
++    with what fields happen to be filled."""
++    patch_ai(returns=(
++        '{"intent":"booking","assistant_reply":"One more thing...",'
++        '"caller_name":"Sam","service_requested":"fade",'
++        '"preferred_barber":null,"preferred_time":"Thursday at 2pm",'
++        '"enough_to_complete":false}'
++    ))
++    state = {"caller_name": "Sam", "service_requested": "fade", "preferred_time": "Thursday at 2pm"}
++    result = ai_service.analyze_customer_turn("Thursday at 2pm", state)
++    assert result["enough_to_complete"] is False
++
++
++# --- integration-level: the real routes, OpenAI down the whole call ---------
++
++@pytest.fixture(scope="module", autouse=True)
++def _setup_db():
++    SQLModel.metadata.create_all(engine)
++    yield
++
++
++@pytest.fixture
++def client():
++    return TestClient(app)
++
++
++def _sign(url: str, params: dict) -> str:
++    validator = RequestValidator(settings.twilio_auth_token)
++    return validator.compute_signature(url, params)
++
++
++def _seeded_business(session: Session) -> Business:
++    business = Business(
++        name="Test Shop",
++        twilio_number="+15559990001",
++        owner_phone="+15555550000",
++        booking_link="https://example.com/book",
++    )
++    session.add(business)
++    session.commit()
++    session.refresh(business)
++    return business
++
++
++def test_call_completes_even_when_openai_is_down_the_whole_time(client, patch_ai, monkeypatch):
++    patch_ai(raises=RuntimeError("simulated OpenAI outage"))
++    # SMS sending isn't the point of this test and has nothing to mock a
++    # Twilio client against here — stub it out so it doesn't error.
++    monkeypatch.setattr("app.routes.voice.send_sms", lambda *a, **k: type("M", (), {"sid": "SMfake"})())
++
++    with Session(engine) as session:
++        business = _seeded_business(session)
++        business_id = business.id
++
++    from_number = "+15550001111"
++    to_number = business.twilio_number
++
++    incoming_params = {"From": from_number, "To": to_number, "CallSid": "CAcompletiontest"}
++    url = f"{settings.base_url}/voice/incoming"
++    resp = client.post("/voice/incoming", data=incoming_params, headers={
++        "X-Twilio-Signature": _sign(url, incoming_params)
++    })
++    assert resp.status_code == 200
++
++    turns = [
++        "my name is Jordan",
++        "I need a haircut",
++        "how about Thursday at 2pm",
++    ]
++    collect_url = f"{settings.base_url}/voice/collect"
++    last_resp = None
++    for text in turns:
++        params = {"From": from_number, "SpeechResult": text}
++        last_resp = client.post("/voice/collect", data=params, headers={
++            "X-Twilio-Signature": _sign(collect_url, params)
++        })
++        assert last_resp.status_code == 200
++
++    # The definitive proof the call actually completed, not just that the
++    # last response was 200: a Lead row exists with the info the caller gave.
++    with Session(engine) as session:
++        lead = session.exec(
++            select(Lead).where(Lead.business_id == business_id)
++        ).first()
++
++    assert lead is not None, "call never completed — enough_to_complete stayed stuck False"
++    assert lead.caller_name == "Jordan"
++    assert lead.service_requested == "haircut"
++    assert lead.preferred_time is not None

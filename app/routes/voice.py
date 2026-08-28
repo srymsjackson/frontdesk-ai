@@ -9,7 +9,7 @@ from app.models import Business
 from app.db import get_session
 from app.schemas import LeadCreate
 from app.services.lead_service import create_lead, mark_booking_link_sent, mark_owner_notified
-from app.services.ai_service import analyze_customer_turn
+from app.services.ai_service import analyze_customer_turn, REQUIRED_FIELDS
 from app.services.config_service import (
     get_business_config,
     get_first_missing_required_field,
@@ -228,9 +228,10 @@ async def collect_turn(
 
     # Simple inline required-field check — just needs to be non-empty.
     # Intentionally does NOT do format validation; "tomorrow", "Saturday",
-    # "asap" are all valid enough to save.
-    REQUIRED = ["caller_name", "service_requested", "preferred_time"]
-    first_missing = next((f for f in REQUIRED if not state.get(f)), None)
+    # "asap" are all valid enough to save. REQUIRED_FIELDS lives in
+    # ai_service.py (imported, not re-declared here) so there's one place
+    # that defines what "complete" means for a call.
+    first_missing = next((f for f in REQUIRED_FIELDS if not state.get(f)), None)
 
     if not result.get("enough_to_complete") or first_missing:
         if first_missing:

@@ -93,6 +93,31 @@ def fallback_response():
     }
 
 
+# The fields voice.py's /voice/collect route requires before it will
+# complete a call — same three the system prompt above tells the model are
+# required. Defined once here so voice.py imports this instead of keeping
+# its own separately-maintained copy that could drift out of sync.
+REQUIRED_FIELDS = ("caller_name", "service_requested", "preferred_time")
+
+
+def _merge_for_completion_check(current_state: dict, data: dict) -> dict:
+    """Preview what state will look like after voice.py's own merge_field
+    step runs moments later, using the same "ignore empty/placeholder
+    values" rule it uses. This lets a fallback path (AI unreachable or
+    returned garbage) judge completion from what's actually been collected
+    across the whole call, not just this one turn."""
+    merged = dict(current_state)
+    for field in REQUIRED_FIELDS:
+        new_value = data.get(field)
+        if new_value not in (None, "", "Unknown"):
+            merged[field] = new_value
+    return merged
+
+
+def _fields_complete(merged_state: dict) -> bool:
+    return all(merged_state.get(field) for field in REQUIRED_FIELDS)
+
+
 def clean_service(service):
     if not service:
         return None
@@ -233,10 +258,12 @@ def analyze_customer_turn(user_text: str, state: dict | None = None) -> dict:
         logger.debug("Raw AI response: %s", raw_text)
 
         data = extract_json(raw_text)
+        used_fallback = False
         if not data:
             logger.warning("JSON parse failed for AI response: %s", raw_text)
             data = fallback_response()
             data["assistant_reply"] = raw_text or data["assistant_reply"]
+            used_fallback = True
 
         data["intent"] = data.get("intent", "booking")
         data["assistant_reply"] = data.get("assistant_reply", "Got you — what day and time were you thinking?")
@@ -244,7 +271,19 @@ def analyze_customer_turn(user_text: str, state: dict | None = None) -> dict:
         data["service_requested"] = clean_service(data.get("service_requested")) or fallback_extract_service(user_text)
         data["preferred_barber"] = clean_barber(data.get("preferred_barber")) or fallback_extract_barber(user_text)
         data["preferred_time"] = clean_time(data.get("preferred_time")) or fallback_extract_time(user_text)
-        data["enough_to_complete"] = bool(data.get("enough_to_complete", False))
+
+        if used_fallback:
+            # The model didn't give us a trustworthy enough_to_complete (it
+            # returned unparseable text), so derive it from what's actually
+            # been collected instead of trusting fallback_response()'s
+            # hardcoded False — otherwise a call that already has every
+            # required field can never complete just because this one turn's
+            # response happened to be garbage.
+            data["enough_to_complete"] = _fields_complete(
+                _merge_for_completion_check(current_state, data)
+            )
+        else:
+            data["enough_to_complete"] = bool(data.get("enough_to_complete", False))
 
         logger.debug("Cleaned data: %s", data)
         return data
@@ -256,4 +295,10 @@ def analyze_customer_turn(user_text: str, state: dict | None = None) -> dict:
         data["service_requested"] = fallback_extract_service(user_text)
         data["preferred_barber"] = fallback_extract_barber(user_text)
         data["preferred_time"] = fallback_extract_time(user_text)
+        # Same reasoning as above: OpenAI being unreachable must not mean a
+        # call can never finish once the caller has actually given every
+        # required field over the course of the call.
+        data["enough_to_complete"] = _fields_complete(
+            _merge_for_completion_check(current_state, data)
+        )
         return data
