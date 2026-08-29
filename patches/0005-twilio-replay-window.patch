@@ -1,0 +1,407 @@
+From 7c237a16f5fe5855df52631298191baa72b7da15 Mon Sep 17 00:00:00 2001
+From: srymsjackson <jstrazzo22@gmail.com>
+Date: Fri, 28 Aug 2026 22:35:14 +0000
+Subject: [PATCH] Add Twilio signature replay-window protection (last item,
+ hardening plan)
+
+Twilio's webhook signature scheme (X-Twilio-Signature, HMAC-SHA1 over URL +
+sorted params) has no nonce or timestamp -- the same URL and params always
+produce the same valid signature, forever. A request captured once (a
+compromised proxy, a debugging tool that logged a raw body, a bug that
+echoed one back) stays replayable indefinitely: resending the exact same
+bytes months later still passes validate().
+
+app/security.py's verify_twilio_signature() now also checks the request
+hasn't been seen before outside a 10-minute window. Deliberately permissive
+in one direction: an exact-duplicate signed request seen again *within* the
+window is silently allowed, not rejected, because Twilio itself retries a
+webhook that times out or returns 5xx with the identical signed request.
+Breaking that would mean flaky network conditions start dropping real
+calls -- worse than the vulnerability being fixed. Only a repeat *outside*
+the window is treated as a replay and rejected with 403.
+
+Request identity is a SHA-256 hash of the URL plus sorted params, so two
+different turns of the same call (same CallSid, different SpeechResult) or
+the same params sent to two different routes are correctly treated as
+different requests, not replays of each other.
+
+Storage is in-process memory (a module-level dict, pruned on each check),
+matching the same tradeoff the app already makes for CALL_STATE in
+app/routes/voice.py -- fine for the single Railway instance this runs on,
+wouldn't survive a restart or share state across horizontally-scaled
+instances. Flagged in the code as the natural next step alongside
+CALL_STATE's own Redis-backed-store TODO, not duplicated as a new one.
+
+Tests: tests/test_twilio_replay_window.py (6 new tests) -- duplicate within
+the window allowed twice, duplicate outside the window rejected, one-second
+boundary case still allowed, different params/different routes correctly
+treated as independent, and a direct test of the pruning logic (HTTP-level
+tests alone can't see whether old entries actually get dropped, and an
+unbounded dict is a slow memory leak that wouldn't otherwise show up as a
+failure). Also added a global _reset_twilio_replay_cache autouse fixture in
+tests/conftest.py, mirroring the existing rate-limiter reset fixture --
+the module-level cache is shared across the whole test session and several
+existing test files send Twilio-signed requests with identical dummy
+params, so without a reset a later test's "first" request could coincide
+with an earlier test's by chance.
+
+Full suite: 111/111 passing. Verified test_duplicate_signed_request_outside_
+window_is_rejected catches a regression by removing the _check_not_replayed
+call entirely and re-running (fails as expected).
+---
+ app/security.py                    |  98 +++++++++++++++--
+ tests/conftest.py                  |  17 +++
+ tests/results.md                   |   6 +-
+ tests/test_twilio_replay_window.py | 166 +++++++++++++++++++++++++++++
+ 4 files changed, 277 insertions(+), 10 deletions(-)
+ create mode 100644 tests/test_twilio_replay_window.py
+
+diff --git a/app/security.py b/app/security.py
+index 9fa669c..fab653f 100644
+--- a/app/security.py
++++ b/app/security.py
+@@ -1,23 +1,105 @@
+ """Request-authentication dependencies shared across routers.
+ 
+-Currently: Twilio webhook signature verification. Twilio signs every request
+-it sends to a configured webhook URL with an X-Twilio-Signature header, an
+-HMAC-SHA1 over (exact URL Twilio POSTed to + sorted POST params) keyed by the
+-account's auth token. Verifying it is the only way to know a request to
+-/voice/* actually came from Twilio and not a scripted POST from anyone who
+-found the URL.
++Currently: Twilio webhook signature verification, plus a replay-window check.
++
++Twilio signs every request it sends to a configured webhook URL with an
++X-Twilio-Signature header, an HMAC-SHA1 over (exact URL Twilio POSTed to +
++sorted POST params) keyed by the account's auth token. Verifying it is the
++only way to know a request to /voice/* actually came from Twilio and not a
++scripted POST from anyone who found the URL.
++
++That signature scheme has no nonce or timestamp, though -- the same URL and
++params always produce the same signature, forever. So a request captured
++once (a compromised proxy, a debugging tool that logged a raw body, a bug
++that echoed one back) stays replayable indefinitely: resending the exact
++same bytes months later still passes validate(). See _check_not_replayed()
++below for how this is mitigated without breaking Twilio's own legitimate
++retries, which are exact-duplicate resends of the same signed request.
+ """
+ 
++import hashlib
+ import logging
++import time
++from urllib.parse import urlencode
++
+ from fastapi import Request, HTTPException
+ from twilio.request_validator import RequestValidator
+ from app.config import settings
+ 
+ logger = logging.getLogger(__name__)
+ 
++# How long an exact-duplicate signed request is still accepted as a
++# legitimate retry before being treated as a replay. Twilio retries a
++# webhook that times out or returns 5xx with the identical signed request,
++# with backoff -- this needs to comfortably outlast that retry window so a
++# real (slow, flaky) legitimate delivery never gets rejected as a replay.
++# Chosen generously for that reason; the cost of getting this wrong in the
++# permissive direction is a longer window an attacker's captured request
++# would work in, not a broken legitimate call.
++REPLAY_WINDOW_SECONDS = 10 * 60  # 10 minutes
++
++# request_key -> first-seen unix timestamp. In-process memory, matching the
++# same tradeoff already made for CALL_STATE in app/routes/voice.py (see its
++# comment, and the README's "known limitations" section): fine for a single
++# Railway instance, wouldn't survive a restart or share state across
++# horizontally-scaled instances. A Redis-backed store would be the natural
++# upgrade alongside CALL_STATE's, if this app ever needs to scale beyond one
++# instance.
++_seen_requests: dict[str, float] = {}
++
++
++def _request_identity(url: str, params: dict) -> str:
++    """A stable, fixed-size identifier for "this exact signed request" --
++    same url + same params (order-independent) always hashes the same way,
++    so a byte-for-byte resend (a replay, or a legitimate Twilio retry) is
++    recognized as the same request rather than a new one."""
++    canonical = url + "?" + urlencode(sorted(params.items()))
++    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
++
++
++def _prune_expired(now: float) -> None:
++    """Drop entries older than twice the replay window. Runs on every call
++    rather than on a schedule -- cheap for the request volumes this app
++    handles (already capped by rate limiting), and means no background task
++    or extra dependency just to keep the dict from growing unboundedly."""
++    cutoff = now - (REPLAY_WINDOW_SECONDS * 2)
++    expired = [key for key, seen_at in _seen_requests.items() if seen_at < cutoff]
++    for key in expired:
++        del _seen_requests[key]
++
++
++def _check_not_replayed(url: str, params: dict) -> None:
++    """Raise if this exact signed request was already seen more than
++    REPLAY_WINDOW_SECONDS ago. Within the window, a repeat is treated as a
++    legitimate Twilio retry and allowed silently -- only a repeat *outside*
++    the window is rejected as a replay.
++    """
++    now = time.time()
++    _prune_expired(now)
++
++    key = _request_identity(url, params)
++    first_seen = _seen_requests.get(key)
++
++    if first_seen is None:
++        _seen_requests[key] = now
++        return
++
++    if now - first_seen > REPLAY_WINDOW_SECONDS:
++        logger.warning(
++            "Rejected replayed Twilio request: identical signed request first seen "
++            "%.0fs ago (window is %ds)",
++            now - first_seen,
++            REPLAY_WINDOW_SECONDS,
++        )
++        raise HTTPException(status_code=403, detail="This request has already been processed")
++    # Within the window: treat as a legitimate retry, don't reset the
++    # first-seen timestamp (the window is measured from the original
++    # request, not extended by each retry).
++
+ 
+ async def verify_twilio_signature(request: Request) -> None:
+-    """FastAPI dependency: 403s any request without a valid Twilio signature.
++    """FastAPI dependency: 403s any request without a valid Twilio signature,
++    and 403s a valid signature replayed outside the retry window.
+ 
+     The signature covers the *exact* URL Twilio requested, so we rebuild it
+     from settings.base_url (the trusted, configured value) rather than
+@@ -49,3 +131,5 @@ async def verify_twilio_signature(request: Request) -> None:
+             bool(signature),
+         )
+         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
++
++    _check_not_replayed(url, params)
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 338652e..918c527 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -49,6 +49,23 @@ def _reset_rate_limits():
+     yield
+ 
+ 
++@pytest.fixture(autouse=True)
++def _reset_twilio_replay_cache():
++    """Same reasoning as _reset_rate_limits above: app.security's
++    _seen_requests dict is a module-level singleton shared across the whole
++    test session, and several test files send Twilio-signed requests with
++    identical params. Without a reset, a later test's "first" request could
++    be seen as a within-window repeat of an earlier test's request purely by
++    coincidence of using the same dummy params -- which happens to still
++    pass (repeats within the window are allowed), but would silently stop
++    testing what it claims to if this dict were never cleared, and would
++    grow unboundedly across a long test session."""
++    from app.security import _seen_requests
++
++    _seen_requests.clear()
++    yield
++
++
+ class _FakeResponse:
+     """Mimics the object returned by client.responses.create()."""
+     def __init__(self, text: str):
+diff --git a/tests/results.md b/tests/results.md
+index 75f4a7e..112c78a 100644
+--- a/tests/results.md
++++ b/tests/results.md
+@@ -1,8 +1,8 @@
+ # Stress-test results
+ 
+-_Generated by the test suite on 2026-08-28 22:13 — re-run `pytest` to refresh._
++_Generated by the test suite on 2026-08-28 22:34 — re-run `pytest` to refresh._
+ 
+-**Overall: 105/105 scenarios passed.**
++**Overall: 111/111 scenarios passed.**
+ 
+ | Category | Passed | Total |
+ | --- | --- | --- |
+@@ -10,6 +10,6 @@ _Generated by the test suite on 2026-08-28 22:13 — re-run `pytest` to refresh.
+ | Ambiguous bookings | 14 | 14 |
+ | Hostile / off-script callers | 9 | 9 |
+ | Failure injection (OpenAI down / malformed) | 9 | 9 |
+-| Uncategorized | 61 | 61 |
++| Uncategorized | 67 | 67 |
+ 
+ All scenarios passed on the most recent run.
+diff --git a/tests/test_twilio_replay_window.py b/tests/test_twilio_replay_window.py
+new file mode 100644
+index 0000000..7f12c09
+--- /dev/null
++++ b/tests/test_twilio_replay_window.py
+@@ -0,0 +1,166 @@
++"""Twilio replay-window tests (Priority 8, the last item of the hardening
++plan).
++
++Twilio's signature scheme (see app/security.py's module docstring) has no
++nonce or timestamp -- the same URL + params always produce the same valid
++signature. These tests confirm the replay-window mitigation actually does
++two things at once, since either one alone would be a real regression:
++
++  1. Rejects an exact-duplicate signed request that shows up again *outside*
++     the window (the actual replay-attack scenario this exists to catch).
++  2. Still accepts an exact-duplicate signed request that shows up again
++     *within* the window (a legitimate Twilio retry after a timeout/5xx --
++     breaking this would mean flaky network conditions start dropping real
++     calls, which is worse than the vulnerability being fixed).
++"""
++
++import pytest
++from fastapi.testclient import TestClient
++from twilio.request_validator import RequestValidator
++
++from app.main import app
++from app.config import settings
++from app.db import engine
++from sqlmodel import SQLModel
++
++
++@pytest.fixture(scope="module", autouse=True)
++def _setup_db():
++    SQLModel.metadata.create_all(engine)
++    yield
++
++
++@pytest.fixture
++def client():
++    return TestClient(app)
++
++
++def _sign(url: str, params: dict) -> str:
++    validator = RequestValidator(settings.twilio_auth_token)
++    return validator.compute_signature(url, params)
++
++
++def test_duplicate_signed_request_within_window_is_allowed_twice(client):
++    """Simulates a Twilio retry: the exact same signed request arrives
++    twice in quick succession. Both must succeed -- rejecting the second
++    would mean a real call gets dropped whenever Twilio's own delivery is
++    briefly slow or flaky."""
++    params = {"From": "+15550002222", "To": "+15559998888", "CallSid": "CAretry001"}
++    url = f"{settings.base_url}/voice/incoming"
++    signature = _sign(url, params)
++
++    first = client.post("/voice/incoming", data=params, headers={"X-Twilio-Signature": signature})
++    second = client.post("/voice/incoming", data=params, headers={"X-Twilio-Signature": signature})
++
++    assert first.status_code == 200
++    assert second.status_code == 200
++
++
++def test_duplicate_signed_request_outside_window_is_rejected(client, monkeypatch):
++    """The actual replay scenario: an identical signed request shows up
++    again well after the retry window has passed. This must now be
++    rejected -- accepting it is exactly the gap this feature closes."""
++    import app.security as security_module
++
++    params = {"From": "+15550003333", "To": "+15559998888", "CallSid": "CAreplay001"}
++    url = f"{settings.base_url}/voice/incoming"
++    signature = _sign(url, params)
++
++    fake_now = [1_000_000.0]
++    monkeypatch.setattr(security_module.time, "time", lambda: fake_now[0])
++
++    first = client.post("/voice/incoming", data=params, headers={"X-Twilio-Signature": signature})
++    assert first.status_code == 200
++
++    # Jump time forward past the replay window.
++    fake_now[0] += security_module.REPLAY_WINDOW_SECONDS + 1
++
++    second = client.post("/voice/incoming", data=params, headers={"X-Twilio-Signature": signature})
++    assert second.status_code == 403
++    assert "already been processed" in second.text
++
++
++def test_request_just_inside_the_window_boundary_is_still_allowed(client, monkeypatch):
++    """Boundary check: one second *before* the window closes should still be
++    treated as a retry, not a replay."""
++    import app.security as security_module
++
++    params = {"From": "+15550004444", "To": "+15559998888", "CallSid": "CAboundary001"}
++    url = f"{settings.base_url}/voice/incoming"
++    signature = _sign(url, params)
++
++    fake_now = [2_000_000.0]
++    monkeypatch.setattr(security_module.time, "time", lambda: fake_now[0])
++
++    first = client.post("/voice/incoming", data=params, headers={"X-Twilio-Signature": signature})
++    assert first.status_code == 200
++
++    fake_now[0] += security_module.REPLAY_WINDOW_SECONDS - 1
++
++    second = client.post("/voice/incoming", data=params, headers={"X-Twilio-Signature": signature})
++    assert second.status_code == 200
++
++
++def test_different_params_are_not_treated_as_a_replay_of_each_other(client):
++    """Two different turns of the same call (different SpeechResult, same
++    CallSid) must not collide -- only a byte-for-byte identical request
++    counts as a duplicate."""
++    url = f"{settings.base_url}/voice/collect"
++
++    params_a = {"CallSid": "CAmultiturn001", "SpeechResult": "I need a haircut"}
++    params_b = {"CallSid": "CAmultiturn001", "SpeechResult": "Tomorrow at 3pm"}
++
++    resp_a = client.post(
++        "/voice/collect", data=params_a, headers={"X-Twilio-Signature": _sign(url, params_a)}
++    )
++    resp_b = client.post(
++        "/voice/collect", data=params_b, headers={"X-Twilio-Signature": _sign(url, params_b)}
++    )
++
++    assert resp_a.status_code != 403
++    assert resp_b.status_code != 403
++
++
++def test_replayed_request_to_a_different_route_is_independent(client, monkeypatch):
++    """The same params replayed against a different endpoint shouldn't be
++    confused with each other -- the request identity includes the URL."""
++    import app.security as security_module
++
++    params = {"CallSid": "CAcrossroute001", "CallStatus": "completed"}
++
++    fake_now = [3_000_000.0]
++    monkeypatch.setattr(security_module.time, "time", lambda: fake_now[0])
++
++    status_url = f"{settings.base_url}/voice/status"
++    status_sig = _sign(status_url, params)
++    resp = client.post("/voice/status", data=params, headers={"X-Twilio-Signature": status_sig})
++    assert resp.status_code == 204
++
++    # Even with an identical params dict, signing it for the *other* route
++    # produces a different signature and a different request identity --
++    # this must be treated as a brand-new request, not a replay of the
++    # /voice/status one above.
++    collect_url = f"{settings.base_url}/voice/collect"
++    collect_sig = _sign(collect_url, params)
++    resp2 = client.post("/voice/collect", data=params, headers={"X-Twilio-Signature": collect_sig})
++    assert resp2.status_code != 403
++
++
++def test_prune_expired_removes_old_entries_but_keeps_recent_ones(monkeypatch):
++    """Directly exercises the cache-cleanup logic, since the HTTP-level tests
++    above don't have visibility into whether old entries actually get
++    dropped (only whether behavior is correct) -- an unbounded dict is a
++    slow memory leak that wouldn't show up as a test failure otherwise."""
++    import app.security as security_module
++
++    fake_now = [4_000_000.0]
++    monkeypatch.setattr(security_module.time, "time", lambda: fake_now[0])
++
++    security_module._seen_requests["old-entry"] = fake_now[0]
++    fake_now[0] += (security_module.REPLAY_WINDOW_SECONDS * 2) + 10
++    security_module._seen_requests["recent-entry"] = fake_now[0]
++
++    security_module._prune_expired(fake_now[0])
++
++    assert "old-entry" not in security_module._seen_requests
++    assert "recent-entry" in security_module._seen_requests
+-- 
+2.43.0
+
