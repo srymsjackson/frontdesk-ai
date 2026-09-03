@@ -22,6 +22,7 @@ from app.models import Business, BusinessConfig
 from app.auth import require_dashboard_auth
 from app.rate_limit import limiter
 from app.config import settings
+from app.billing_tokens import create_checkout_token
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,22 @@ def render_form(
                 </span>
             </div>
         """
+        if not business.is_active:
+            # Checkout tokens expire (see billing_tokens.CHECKOUT_LINK_MAX_AGE_SECONDS)
+            # and the create page only shows them once. Re-mint here so a prospect
+            # who said "send it to me next week" can still be sent a working link.
+            base = settings.base_url.rstrip("/")
+            basic_token = create_checkout_token(business_id=business.id, plan="basic")
+            pro_token = create_checkout_token(business_id=business.id, plan="pro")
+            status_html += f"""
+            <div class="status-row">
+                <span class="hint">
+                    Checkout links (fresh, valid 30 days):<br>
+                    Basic: <a href="{base}/billing/checkout?token={basic_token}">{base}/billing/checkout?token={basic_token}</a><br>
+                    Pro: <a href="{base}/billing/checkout?token={pro_token}">{base}/billing/checkout?token={pro_token}</a>
+                </span>
+            </div>
+            """
 
     active_override_html = ""
     if edit_mode:
@@ -354,8 +371,13 @@ def create_business(
     logger.info("Onboarded new business id=%s name=%s", business.id, business.name)
 
     base = settings.base_url.rstrip("/")
-    basic_link = f"{base}/billing/checkout?business_id={business.id}&plan=basic"
-    pro_link = f"{base}/billing/checkout?business_id={business.id}&plan=pro"
+    # /billing/checkout only accepts a signed token (see app/billing_tokens.py);
+    # raw ?business_id=&plan= links get a 400. Mint one token per plan here so
+    # the links on this page are the ones that actually work.
+    basic_token = create_checkout_token(business_id=business.id, plan="basic")
+    pro_token = create_checkout_token(business_id=business.id, plan="pro")
+    basic_link = f"{base}/billing/checkout?token={basic_token}"
+    pro_link = f"{base}/billing/checkout?token={pro_token}"
     edit_link = f"{base}/onboarding/edit/{business.id}"
 
     success_html = (

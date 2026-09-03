@@ -11,6 +11,8 @@ token regardless of *why* it's bad.
 """
 
 import os
+import re
+import uuid
 
 import pytest
 from fastapi.testclient import TestClient
@@ -179,15 +181,78 @@ def test_onboarding_generates_token_links_not_raw_business_id(client):
     login = client.post("/login", data={"key": os.environ["DASHBOARD_KEY"]})
     assert login.status_code == 303
 
+    # Unique per run: /onboarding/create rejects a reused Twilio number, and
+    # the on-disk test DB can survive between runs.
+    unique_number = "+1555" + str(uuid.uuid4().int)[:7]
     resp = client.post(
         "/onboarding/create",
         data={
             "name": "Onboarding Link Test Co",
-            "twilio_number": "+15555552222",
+            "twilio_number": unique_number,
             "owner_phone": "+15555550002",
+            "timezone": "America/Denver",
         },
     )
     assert resp.status_code == 200
     assert "billing/checkout?token=" in resp.text
     assert "business_id=" not in resp.text
     assert "&plan=" not in resp.text
+
+    # The links must actually be accepted by /billing/checkout, not just
+    # look right -- this is the exact path a paying customer clicks.
+    # Each link appears twice (href + visible text), so dedupe.
+    tokens = set(re.findall(r"billing/checkout\?token=([^\"<]+)", resp.text))
+    assert len(tokens) == 2
+    for tok in tokens:
+        checkout = client.get(f"/billing/checkout?token={tok}")
+        assert checkout.status_code == 303, checkout.text
+
+
+def test_edit_page_shows_fresh_checkout_links_while_inactive(client):
+    """Tokens expire and the create page shows them once. The edit page must
+    re-mint working links for any business that hasn't paid yet, so a
+    prospect who asks for the link later can still be sent one."""
+    with DBSession(engine) as db:
+        b = Business(
+            name="Not Paid Yet Co",
+            twilio_number="+15555554444",
+            owner_phone="+15555550004",
+            is_active=False,  # what /onboarding/create sets; the model default is True
+        )
+        db.add(b)
+        db.commit()
+        db.refresh(b)
+
+    login = client.post("/login", data={"key": os.environ["DASHBOARD_KEY"]})
+    assert login.status_code == 303
+
+    resp = client.get(f"/onboarding/edit/{b.id}")
+    assert resp.status_code == 200
+    tokens = set(re.findall(r"billing/checkout\?token=([^\"<]+)", resp.text))
+    assert len(tokens) == 2
+    for tok in tokens:
+        assert verify_checkout_token(tok) is not None
+        assert client.get(f"/billing/checkout?token={tok}").status_code == 303
+
+
+def test_edit_page_hides_checkout_links_once_active(client):
+    """No point offering a paid business a link to pay again."""
+    with DBSession(engine) as db:
+        b = Business(
+            name="Already Paid Co",
+            twilio_number="+15555553333",
+            owner_phone="+15555550003",
+            is_active=True,
+            subscription_status="active",
+            plan="basic",
+        )
+        db.add(b)
+        db.commit()
+        db.refresh(b)
+
+    login = client.post("/login", data={"key": os.environ["DASHBOARD_KEY"]})
+    assert login.status_code == 303
+
+    resp = client.get(f"/onboarding/edit/{b.id}")
+    assert resp.status_code == 200
+    assert "billing/checkout?token=" not in resp.text

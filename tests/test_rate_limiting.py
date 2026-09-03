@@ -80,6 +80,7 @@ def test_onboarding_create_rate_limited_after_5_per_minute(client):
                 "name": f"Test Biz {i}",
                 "twilio_number": f"+1555000{i:04d}",
                 "owner_phone": "+15555550000",
+                "timezone": "America/Denver",
             },
         )
         statuses.append(resp.status_code)
